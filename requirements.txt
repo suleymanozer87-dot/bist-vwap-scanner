@@ -1,0 +1,5 @@
+streamlit>=1.62
+pandas>=2.0
+plotly>=5.18
+yfinance>=0.2.40
+streamlit-aggrid>=1.0.5

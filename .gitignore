@@ -1,0 +1,5 @@
+.vwap_ayarlar.json
+veri_onbellek/
+__pycache__/
+*.pyc
+.DS_Store
