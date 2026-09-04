@@ -520,7 +520,6 @@ def render_chart_page_if_requested():
         "alternation": "Alternasyon",
     }
     st.title(f"{sym} · {title_map.get(kind, 'Grafik')}")
-    st.caption("Mobilde parmağınızla sürükleyin ve iki parmakla yakınlaştırın. Grafik ilgili formasyon bölgesine otomatik odaklanır.")
     render_quality_panel(result, compact=True)
 
     if not chart_payload_complete(kind, result):
