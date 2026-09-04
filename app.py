@@ -131,11 +131,17 @@ hr { border-color:#dbe6ee !important; }
     .nav-shell { padding:9px 9px 3px 9px; margin-bottom:10px; }
     .nav-label { font-size:.70rem; margin-bottom:4px; }
     .stButton > button, .stDownloadButton > button { width:100% !important; min-height:2.9rem !important; }
-    [data-testid="stPlotlyChart"] { min-height:430px !important; }
+    [data-testid="stPlotlyChart"] { min-height:540px !important; touch-action:none !important; }
+    [data-testid="stPlotlyChart"] .js-plotly-plot,
+    [data-testid="stPlotlyChart"] .plot-container,
+    [data-testid="stPlotlyChart"] .svg-container { touch-action:none !important; }
+    [data-testid="stPlotlyChart"] .modebar { opacity:1 !important; }
+    [data-testid="stPlotlyChart"] .modebar-btn { min-width:34px !important; min-height:34px !important; padding:7px !important; }
+    div[role="radiogroup"] { gap:.25rem !important; flex-wrap:wrap !important; }
 }
 @media (max-width: 430px) {
     .block-container { padding-left:.30rem; padding-right:.30rem; }
-    [data-testid="stPlotlyChart"] { min-height:410px !important; }
+    [data-testid="stPlotlyChart"] { min-height:520px !important; }
 }
 </style>
 """,
@@ -364,7 +370,7 @@ def render_live_scan_status():
     detail = snap.get("detail") or ""
 
     if status in {"queued", "running"}:
-        st.info(f"📡 **{kind} arka planda devam ediyor.** Telefon ekranını kapatabilir veya başka uygulamaya geçebilirsin; geri geldiğinde aynı işe bağlanırsın.")
+        st.info(f"🛰️ **{kind} ayrı worker prosesinde devam ediyor.** Telefon ekranı kapansa bile tarama Streamlit oturumuna bağlı değildir; geri geldiğinde kayıtlı işe yeniden bağlanır.")
         st.progress(max(0.0, min(1.0, progress)), text=detail or f"{kind} sürüyor...")
         st.caption(f"İş no: {snap.get('id')} · Başlangıç: {snap.get('started_at') or 'hazırlanıyor'}")
         return
@@ -553,7 +559,7 @@ def result_rows(view, items):
         }
         if view == "VWAP":
             base.update({
-                "Seviye": f"VWAP-{r.get('level', '—')}",
+                "Seviye": f"{r.get('level', '—')}. VWAP",
                 "Kırılma": r.get("cross_date", "—"),
                 "Bar Önce": r.get("bars_ago", "—"),
                 "Son Kapanış": r.get("last_close", "—"),
@@ -605,7 +611,7 @@ def render_results_page():
     active_job = _resolve_job_snapshot(auto_attach_running=True)
     if not any(sets.get(n) is not None for n in names):
         if active_job and active_job.get("status") in {"queued", "running"}:
-            st.info("Tarama sunucuda devam ediyor. Bu sayfayı kapatsan bile iş devam edecek; sonuçlar tamamlanınca burada görünecek.")
+            st.info("Tarama ayrı worker prosesinde devam ediyor. Ekran kapansa bile iş Streamlit oturumundan bağımsızdır; geri geldiğinde checkpoint durumundan yeniden bağlanır.")
         else:
             st.info("Henüz tarama sonucu yok. Tarama sayfasından bir tarama başlatın.")
             if st.button("🔎 Tarama sayfasına git", type="primary", width="stretch"):
@@ -639,7 +645,7 @@ def render_results_page():
         overview_df = pd.DataFrame([
             {
                 "Sembol": str(r.get("symbol", "—")),
-                "Tarama": name,
+                "Tarama": (f"VWAP · {r.get('level', '—')}. VWAP" if name == "VWAP" else name),
                 "Yükseliş Puanı": round(q_score(r), 1),
                 "Kalite": q_grade(r),
                 "Teyitler": q_reasons(r),
@@ -678,6 +684,28 @@ def render_results_page():
     items = list(sets.get(view) or [])
     m = meta.get(view) or {}
     errors = list(m.get("errors") or [])
+
+    # VWAP zinciri sonucu kullanıcı için doğrudan 1./2./3. VWAP olarak
+    # ayrılır. Bu yalnız sonuç görünüm filtresidir; tarama mantığını ve
+    # zincir hesabını değiştirmez.
+    if view == "VWAP":
+        level_counts = {
+            level: sum(1 for r in items if int(r.get("level") or 0) == level)
+            for level in (1, 2, 3)
+        }
+        level_options = [
+            f"Tümü ({len(items)})",
+            f"1. VWAP ({level_counts[1]})",
+            f"2. VWAP ({level_counts[2]})",
+            f"3. VWAP ({level_counts[3]})",
+        ]
+        level_choice = st.radio(
+            "VWAP seviyesi", level_options, horizontal=True,
+            key="vwap_level_filter",
+        )
+        if not level_choice.startswith("Tümü"):
+            selected_level = int(level_choice.split(".", 1)[0])
+            items = [r for r in items if int(r.get("level") or 0) == selected_level]
 
     st.caption(
         f"Periyot: **{m.get('period') or '—'}** · Taranan: **{m.get('total') or '—'}** · "

@@ -100,9 +100,12 @@ PLOTLY_CONFIG = {
     "responsive": True,
     "scrollZoom": True,
     "displaylogo": False,
-    "displayModeBar": "hover",
-    "modeBarButtonsToRemove": ["lasso2d", "select2d", "zoomIn2d", "zoomOut2d", "autoScale2d"],
-    "doubleClick": "reset",
+    # Mobilde hover olmadığı için araç çubuğu sürekli görünür. Böylece
+    # Pan / Zoom / +/- / Autoscale / Reset kontrollerine telefonda da
+    # doğrudan dokunulabilir.
+    "displayModeBar": True,
+    "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+    "doubleClick": "reset+autosize",
 }
 
 
@@ -259,7 +262,10 @@ def _finalize_price_volume_axes(fig, tickvals, ticktext, price_range, y_title):
     fig.update_xaxes(
         row=2, col=1,
         tickvals=tickvals, ticktext=ticktext, tickangle=-35,
-        rangeslider_visible=False, showgrid=False,
+        # Mobilde grafiğin kendisini sürüklemek zor olursa alttaki zaman
+        # sürgüsüyle görünür pencere kolayca sağa/sola taşınabilir.
+        rangeslider=dict(visible=True, thickness=0.07, bgcolor="#eef2f7", bordercolor="#cbd5e1", borderwidth=1),
+        showgrid=False,
         showticklabels=True, tickfont=dict(size=10), fixedrange=False,
         showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
         spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
@@ -325,22 +331,60 @@ def _focused_price_range(df, start_idx, end_idx=None):
 
 
 def _mobile_friendly_layout(fig, title):
-    """Masaüstünde de temiz, telefonda taşmayan ortak grafik görünümü."""
+    """Masaüstünde de temiz, telefonda dokunarak kullanılabilen ortak görünüm."""
     fig.update_layout(
         title=dict(text=title, font=dict(size=16), x=0.01, xanchor="left"),
-        height=500,
+        height=560,
         template="plotly_white",
+        # Varsayılan hareket tek parmakla kaydırma. Kullanıcı araç çubuğundan
+        # büyüteci seçerse kutu/zoom moduna geçebilir.
         dragmode="pan",
         legend=dict(
             orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
             font=dict(size=9), itemwidth=30,
         ),
-        margin=dict(l=8, r=46, t=72, b=58),
+        margin=dict(l=6, r=42, t=78, b=52),
         bargap=0.0,
         hovermode="closest",
         hoverlabel=dict(font_size=11),
         autosize=True,
     )
+
+
+def _chart_view_controls(fig, df, default_start, default_end, key):
+    """Mobil/PC için hızlı görünüm seçimi ve kullanım ipucu.
+
+    Plotly'nin dokunmatik pan/zoom'u cihaz/tarayıcıya göre değişebildiği için
+    kullanıcıya grafik üstünde ayrıca güvenilir bir görünüm kısayolu verir.
+    Bu sadece çizim aralığını değiştirir; tarama/sinyal verisine dokunmaz.
+    """
+    n = len(df)
+    if n <= 0:
+        return 0, 0
+    safe_key = str(key or "chart").replace(" ", "_")
+    choice = st.radio(
+        "Grafik görünümü",
+        ["Sinyale odaklan", "40 mum", "80 mum", "Tümü"],
+        index=0, horizontal=True,
+        key=f"{safe_key}_view",
+        label_visibility="collapsed",
+    )
+    st.caption("📱 Tek parmak: kaydır · İki parmak: yakınlaştır · Üst araç çubuğu: Pan / Zoom / +/- / Sıfırla")
+
+    if choice == "40 mum":
+        start, end = max(0, n - 40), n - 1
+    elif choice == "80 mum":
+        start, end = max(0, n - 80), n - 1
+    elif choice == "Tümü":
+        start, end = 0, n - 1
+    else:
+        start = max(0, int(default_start or 0))
+        end = min(n - 1, int(default_end if default_end is not None else n - 1))
+
+    # Sağ tarafta iki mum kadar boşluk, son fiyat etiketinin sıkışmasını önler.
+    fig.update_xaxes(range=[start - 0.5, end + 2.5], row=1, col=1)
+    fig.update_xaxes(range=[start - 0.5, end + 2.5], row=2, col=1)
+    return start, end
 
 
 def _add_last_price_line(fig, last_price, is_up):
@@ -468,6 +512,7 @@ def render_vwap_chart(sym, r, key=None):
     _mobile_friendly_layout(fig, f"{sym} · VWAP-{r['level']} · {period_label}")
     focus_start = max(0, int(r.get("cross_idx", n - 1)) - 45)
     view_start, view_end = _focus_recent_pattern(fig, n, start_hint=focus_start, end_extra=2, min_bars=55, max_bars=100)
+    view_start, view_end = _chart_view_controls(fig, df, view_start, view_end, key)
     _finalize_price_volume_axes(
         fig, tickvals, ticktext,
         price_range=_focused_price_range(df, view_start, view_end),
@@ -569,6 +614,7 @@ def render_triangle_chart(sym, r, key=None):
     pattern_start = min(int(upper.get("x1", 0)), int(lower.get("x1", 0)))
     extra = min(8, max(2, int(r.get("apex_bars_ahead") or 2)))
     view_start, view_end = _focus_recent_pattern(fig, n, start_hint=pattern_start, end_extra=extra, min_bars=55, max_bars=105)
+    view_start, view_end = _chart_view_controls(fig, df, view_start, view_end, key)
     # --- Y ekseni aralığını MUMLARIN kendi fiyat aralığına göre SABİTLE ---
     # Apex noktası/uzantısı ileri bir bara projekte edildiği için, eğim dik
     # olduğunda (örn. sıkışmış küçük bir pivot aralığından hesaplanan eğim
@@ -660,6 +706,7 @@ def render_trendline_chart(sym, r, key=None):
 
     _mobile_friendly_layout(fig, f"{sym} · Düşen Trend Kırılımı · {period_label}")
     view_start, view_end = _focus_recent_pattern(fig, n, start_hint=int(line.get("x1", 0)), end_extra=2, min_bars=55, max_bars=105)
+    view_start, view_end = _chart_view_controls(fig, df, view_start, view_end, key)
     # --- Y ekseni aralığını MUMLARIN kendi fiyat aralığına göre SABİTLE ---
     # (bkz. render_triangle_chart'taki aynı isimli blok) — kırılım
     # uzantısı çok dik bir eğimde bugüne yansıtılırsa autorange bunu tek
@@ -745,6 +792,7 @@ def render_alternation_chart(sym, r, key=None):
 
     _mobile_friendly_layout(fig, f"{sym} · Alternasyon · {period_label}")
     view_start, view_end = _focus_recent_pattern(fig, n, start_hint=max(0, int(start_idx) - 20), end_extra=2, min_bars=55, max_bars=95)
+    view_start, view_end = _chart_view_controls(fig, df, view_start, view_end, key)
     _finalize_price_volume_axes(
         fig, tickvals, ticktext,
         price_range=_focused_price_range(df, view_start, view_end),

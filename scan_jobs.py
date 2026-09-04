@@ -1,87 +1,272 @@
 # -*- coding: utf-8 -*-
-"""Streamlit oturumundan bağımsız arka plan tarama işleri.
+"""Kalıcı / yeniden bağlanabilir tarama iş yöneticisi.
 
-Amaç: Mobil tarayıcı askıya alınsa / WebSocket kısa süreli kopsa bile tarama
-sunucu prosesinde devam etsin. UI geri bağlandığında iş durumu ve sonuçlar
-aynı job_id üzerinden tekrar alınır.
+V4.6: Streamlit oturumuna bağlı ThreadPoolExecutor yerine ayrı bir Python
+worker prosesi kullanır. İş durumu ve sonuçlar /tmp altında atomik dosyalara
+kaydedilir. Böylece mobil tarayıcı ekranı kapandığında WebSocket kopsa bile
+worker Streamlit oturumundan bağımsız çalışmaya devam eder.
+
+Not: Community Cloud konteynerinin kendisi reboot/redeploy edilirse /tmp
+silinir ve çalışan prosesler durur. Normal ekran kapatma / uygulama değiştirme
+senaryosunda ise worker ayrı proses olarak devam eder.
 """
 
 from __future__ import annotations
 
+import errno
+import json
+import os
+import pickle
+import signal
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from pathlib import Path
 
-import streamlit as st
+BASE_DIR = Path(__file__).resolve().parent
+JOB_ROOT = Path(tempfile.gettempdir()) / "bist_vwap_scan_jobs_v46"
+JOB_ROOT.mkdir(parents=True, exist_ok=True)
 
-from vwap_core import (
-    ALTERNATION_SCAN_PERIOD_LABELS,
-    PERIOD_LABELS,
-    TRENDLINE_SCAN_PERIOD_LABELS,
-    TRIANGLE_SCAN_PERIOD_LABELS,
-    scan_alternation_symbols_parallel,
-    scan_symbols_parallel,
-    scan_trendline_symbols_parallel,
-    scan_triangle_symbols_parallel,
-)
+_STATE_LOCK = threading.RLock()
+_MANAGER = None
 
 
-def _now_text():
-    return datetime.now().strftime("%d.%m.%Y %H:%M")
-
-
-def _now_ts():
+def _now_ts() -> float:
     return time.time()
 
 
+def _job_dir(job_id: str) -> Path:
+    return JOB_ROOT / str(job_id)
+
+
+def _state_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "state.json"
+
+
+def _result_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "results.pkl"
+
+
+def _config_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "job.json"
+
+
+def _log_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "worker.log"
+
+
+def _lock_path(job_id: str) -> Path:
+    return _job_dir(job_id) / ".launch.lock"
+
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _atomic_write_pickle(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _read_pickle(path: Path, default=None):
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return default
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        pid = int(pid or 0)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    # Linux'ta sonlanmış fakat parent tarafından henüz reap edilmemiş zombie
+    # proses için os.kill(pid, 0) hâlâ başarılı döner. /proc durumunu ayrıca kontrol et.
+    if os.name != "nt":
+        try:
+            stat_path = Path(f"/proc/{pid}/stat")
+            if stat_path.exists():
+                parts = stat_path.read_text(encoding="utf-8", errors="ignore").split()
+                if len(parts) >= 3 and parts[2] == "Z":
+                    return False
+        except Exception:
+            pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    except Exception:
+        return False
+
+
+def _job_snapshot_from_disk(job_id: str):
+    state = _read_json(_state_path(job_id))
+    if not state:
+        return None
+    payload = _read_pickle(_result_path(job_id), default={}) or {}
+    out = dict(state)
+    out["result_sets"] = dict(payload.get("result_sets") or {})
+    out["result_meta"] = dict(payload.get("result_meta") or {})
+    return out
+
+
+def _acquire_launch_lock(job_id: str):
+    p = _lock_path(job_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        # Eski kilit 60 saniyeden uzun kaldıysa temizle.
+        try:
+            if _now_ts() - p.stat().st_mtime > 60:
+                p.unlink(missing_ok=True)
+                return _acquire_launch_lock(job_id)
+        except Exception:
+            pass
+        return False
+
+
+def _release_launch_lock(job_id: str):
+    try:
+        _lock_path(job_id).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _spawn_worker(job_id: str) -> bool:
+    """Worker'ı Streamlit script thread'inden bağımsız proses olarak başlat."""
+    if not _acquire_launch_lock(job_id):
+        return False
+    try:
+        state = _read_json(_state_path(job_id), {}) or {}
+        if _pid_alive(state.get("pid")):
+            return True
+
+        log_path = _log_path(job_id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_f = open(log_path, "ab", buffering=0)
+        worker_script = Path(os.environ.get("BIST_SCAN_WORKER_SCRIPT") or (BASE_DIR / "scan_worker.py"))
+        cmd = [sys.executable, str(worker_script), str(job_id)]
+        kwargs = {
+            "cwd": str(BASE_DIR),
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,
+            "close_fds": True,
+            "env": {**os.environ, "PYTHONUNBUFFERED": "1"},
+        }
+        if os.name == "nt":
+            flags = 0
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+            kwargs["creationflags"] = flags
+        else:
+            kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(cmd, **kwargs)
+        try:
+            log_f.close()
+        except Exception:
+            pass
+        state.update({
+            "pid": int(proc.pid),
+            "status": state.get("status") if state.get("status") in {"queued", "running"} else "queued",
+            "detail": state.get("detail") or "Arka plan worker başlatıldı.",
+            "updated_ts": _now_ts(),
+            "heartbeat_ts": _now_ts(),
+        })
+        _atomic_write_json(_state_path(job_id), state)
+        return True
+    finally:
+        _release_launch_lock(job_id)
+
+
 class ScanJobManager:
-    """Tek proses içinde kalıcı tarama işlerini yönetir.
-
-    Streamlit Session State'ten bağımsızdır. Community Cloud prosesinin kendisi
-    yeniden başlatılırsa işler kaybolabilir; fakat normal mobil ekran kapatma,
-    uygulama değiştirme veya geçici WebSocket kopmalarında devam eder.
-    """
-
     def __init__(self):
-        self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bist-scan-job")
-        self._jobs = {}
-        self._latest_job_id = None
+        JOB_ROOT.mkdir(parents=True, exist_ok=True)
 
     def _prune(self):
         now = _now_ts()
-        removable = []
-        for job_id, job in self._jobs.items():
-            if job.get("status") in {"completed", "failed"} and now - float(job.get("updated_ts") or now) > 6 * 3600:
-                removable.append(job_id)
-        for job_id in removable:
-            self._jobs.pop(job_id, None)
-        if len(self._jobs) > 8:
-            ordered = sorted(
-                self._jobs.items(),
-                key=lambda kv: float(kv[1].get("created_ts") or 0),
-            )
-            for job_id, job in ordered:
-                if len(self._jobs) <= 8:
-                    break
-                if job.get("status") in {"completed", "failed"}:
-                    self._jobs.pop(job_id, None)
+        dirs = []
+        for d in JOB_ROOT.iterdir():
+            if not d.is_dir():
+                continue
+            state = _read_json(d / "state.json", {}) or {}
+            dirs.append((d, float(state.get("created_ts") or 0), state))
+            if state.get("status") in {"completed", "failed", "cancelled"}:
+                if now - float(state.get("updated_ts") or now) > 12 * 3600:
+                    try:
+                        import shutil
+                        shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
+        # En fazla 10 iş klasörü tut.
+        dirs.sort(key=lambda x: x[1], reverse=True)
+        for d, _, state in dirs[10:]:
+            if state.get("status") in {"completed", "failed", "cancelled"}:
+                try:
+                    import shutil
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
 
     def start(self, kind, symbols, cfg):
         kind = str(kind)
         symbols = list(symbols or [])
         cfg = dict(cfg or {})
-        with self._lock:
-            # Aynı proses içinde aynı anda iki büyük Yahoo taraması başlatmayalım.
-            for existing in self._jobs.values():
-                if existing.get("status") in {"queued", "running"}:
-                    return existing["id"], False
+        with _STATE_LOCK:
+            self._prune()
+            active = self.active_snapshot()
+            if active:
+                # Worker öldüyse aynı işi kaldığı checkpoint'ten canlandır.
+                if not _pid_alive(active.get("pid")):
+                    _spawn_worker(active["id"])
+                    active = self.snapshot(active["id"]) or active
+                return active["id"], False
 
             job_id = uuid.uuid4().hex[:12]
+            d = _job_dir(job_id)
+            d.mkdir(parents=True, exist_ok=True)
             created = _now_ts()
-            job = {
+            spec = {
+                "id": job_id,
+                "kind": kind,
+                "symbols": symbols,
+                "cfg": cfg,
+                "created_ts": created,
+            }
+            state = {
                 "id": job_id,
                 "kind": kind,
                 "status": "queued",
@@ -92,281 +277,113 @@ class ScanJobManager:
                 "total": len(symbols),
                 "created_ts": created,
                 "updated_ts": created,
+                "heartbeat_ts": created,
                 "started_at": None,
                 "finished_at": None,
                 "error": None,
-                "result_sets": {},
-                "result_meta": {},
                 "revision": 0,
+                "pid": None,
+                "phase_index": 0,
+                "phase_name": "",
+                "cursor": 0,
             }
-            self._jobs[job_id] = job
-            self._latest_job_id = job_id
-            self._prune()
-            self._executor.submit(_background_scan_worker, self, job_id, kind, symbols, cfg)
+            _atomic_write_json(_config_path(job_id), spec)
+            _atomic_write_json(_state_path(job_id), state)
+            _atomic_write_pickle(_result_path(job_id), {"result_sets": {}, "result_meta": {}})
+            _spawn_worker(job_id)
             return job_id, True
 
-    def update(self, job_id, **updates):
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if not job:
-                return
-            job.update(updates)
-            job["updated_ts"] = _now_ts()
-
-    def set_result(self, job_id, name, rows, meta):
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if not job:
-                return
-            job["result_sets"][name] = list(rows or [])
-            job["result_meta"][name] = dict(meta or {})
-            job["revision"] = int(job.get("revision") or 0) + 1
-            job["updated_ts"] = _now_ts()
-
-    def complete(self, job_id):
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if not job:
-                return
-            job.update({
-                "status": "completed",
-                "progress": 1.0,
-                "detail": "Tarama tamamlandı.",
-                "finished_at": _now_text(),
-                "updated_ts": _now_ts(),
-                "revision": int(job.get("revision") or 0) + 1,
-            })
-
-    def fail(self, job_id, exc):
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if not job:
-                return
-            job.update({
-                "status": "failed",
-                "detail": "Tarama hata ile durdu.",
-                "error": str(exc),
-                "finished_at": _now_text(),
-                "updated_ts": _now_ts(),
-                "revision": int(job.get("revision") or 0) + 1,
-            })
-
     def snapshot(self, job_id):
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if not job:
+        if not job_id:
+            return None
+        with _STATE_LOCK:
+            state = _read_json(_state_path(job_id))
+            if not state:
                 return None
-            # DataFrame içeren sonuçları deep-copy etmiyoruz; sonuç setleri yalnız
-            # tamamlandıktan sonra yayınlandığı için referansları güvenle okunabilir.
-            out = dict(job)
-            out["result_sets"] = dict(job.get("result_sets") or {})
-            out["result_meta"] = dict(job.get("result_meta") or {})
+            status = state.get("status")
+            if status in {"queued", "running"} and not _pid_alive(state.get("pid")):
+                # Worker beklenmedik şekilde durmuşsa checkpoint'ten yeniden başlat.
+                # 2 sn tolerans: worker PID'sini yazmadan önceki kısa yarış durumunu önler.
+                if _now_ts() - float(state.get("updated_ts") or 0) > 2:
+                    state["detail"] = "Worker bağlantısı yenileniyor; kayıtlı noktadan devam edecek..."
+                    state["updated_ts"] = _now_ts()
+                    _atomic_write_json(_state_path(job_id), state)
+                    _spawn_worker(job_id)
+                    state = _read_json(_state_path(job_id), state) or state
+            payload = _read_pickle(_result_path(job_id), default={}) or {}
+            out = dict(state)
+            out["result_sets"] = dict(payload.get("result_sets") or {})
+            out["result_meta"] = dict(payload.get("result_meta") or {})
             return out
 
     def latest_snapshot(self):
-        with self._lock:
-            job_id = self._latest_job_id
-        return self.snapshot(job_id) if job_id else None
+        candidates = []
+        for d in JOB_ROOT.iterdir():
+            if not d.is_dir():
+                continue
+            state = _read_json(d / "state.json")
+            if state:
+                candidates.append((float(state.get("created_ts") or 0), state.get("id")))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return self.snapshot(candidates[0][1])
 
     def active_snapshot(self):
-        with self._lock:
-            for job in reversed(list(self._jobs.values())):
-                if job.get("status") in {"queued", "running"}:
-                    return self.snapshot(job.get("id"))
-        return None
+        candidates = []
+        for d in JOB_ROOT.iterdir():
+            if not d.is_dir():
+                continue
+            state = _read_json(d / "state.json")
+            if state and state.get("status") in {"queued", "running"}:
+                candidates.append((float(state.get("created_ts") or 0), state.get("id")))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return self.snapshot(candidates[0][1])
 
 
-@st.cache_resource(show_spinner=False)
 def get_scan_job_manager():
-    return ScanJobManager()
+    global _MANAGER
+    if _MANAGER is None:
+        with _STATE_LOCK:
+            if _MANAGER is None:
+                _MANAGER = ScanJobManager()
+    return _MANAGER
 
 
-def _meta(total, period, errors, source, currency=None):
+# Worker'ın kullanacağı dar yardımcı API. Bunlar Streamlit import etmez.
+def worker_paths(job_id: str):
     return {
-        "total": int(total or 0),
-        "period": period,
-        "errors": list(errors or []),
-        "source": source,
-        "currency": currency,
-        "scan_time": _now_text(),
+        "job": _config_path(job_id),
+        "state": _state_path(job_id),
+        "results": _result_path(job_id),
+        "log": _log_path(job_id),
     }
 
 
-def _job_progress(manager, job_id, label, start=0.0, span=1.0):
-    def cb(done, total, sym):
-        ratio = (done / total) if total else 1.0
-        overall = max(0.0, min(1.0, float(start) + float(span) * ratio))
-        manager.update(
-            job_id,
-            status="running",
-            progress=overall,
-            detail=f"{label}: {done}/{total} · {sym}",
-            current_symbol=str(sym or ""),
-            done=int(done or 0),
-            total=int(total or 0),
-        )
-    return cb
+def worker_read_job(job_id: str):
+    return _read_json(_config_path(job_id))
 
 
-def _scan_vwap(manager, job_id, symbols, cfg, start=0.0, span=1.0, source="VWAP taraması"):
-    errors = []
-    callback = _job_progress(manager, job_id, "VWAP taranıyor", start, span)
-    results, _, _, _, _, _ = scan_symbols_parallel(
-        symbols,
-        cfg.get("period", "weekly"),
-        lookback=int(cfg.get("lookback", 3)),
-        max_workers=int(cfg.get("max_workers", 20)),
-        use_cache=bool(cfg.get("use_cache", True)),
-        progress_callback=callback,
-        errors_out=errors,
-        sideways_enabled=bool(cfg.get("sideways_enabled", False)),
-        sideways_months_list=list(cfg.get("sideways_months_list") or [3, 6, 12]),
-        sideways_range_pct=float(cfg.get("sideways_range_pct", 15.0)),
-        sideways_atr_pct=float(cfg.get("sideways_atr_pct", 5.0)),
-        sideways_method=str(cfg.get("sideways_method", "range")),
-        sideways_min_windows=cfg.get("sideways_min_windows"),
-        drawdown_enabled=bool(cfg.get("drawdown_enabled", False)),
-        drawdown_min_pct=float(cfg.get("drawdown_min_pct", 60.0)),
-        alternation_enabled=False,
-        trendline_enabled=False,
-        triangle_enabled=False,
-        currency=str(cfg.get("currency", "TRY")),
-    )
-    manager.set_result(
-        job_id,
-        "VWAP",
-        results,
-        _meta(
-            len(symbols),
-            PERIOD_LABELS.get(cfg.get("period"), cfg.get("period")),
-            errors,
-            source,
-            cfg.get("currency"),
-        ),
-    )
-    return results, errors
+def worker_read_state(job_id: str):
+    return _read_json(_state_path(job_id), {}) or {}
 
 
-def _scan_triangle(manager, job_id, symbols, cfg, start=0.0, span=1.0, source="Üçgen taraması"):
-    errors = []
-    callback = _job_progress(manager, job_id, "Üçgen taranıyor", start, span)
-    results = scan_triangle_symbols_parallel(
-        symbols,
-        cfg.get("tri_scan_period", "4h"),
-        max_workers=int(cfg.get("max_workers", 20)),
-        use_cache=bool(cfg.get("use_cache", True)),
-        progress_callback=callback,
-        errors_out=errors,
-        pivot_window=int(cfg.get("tri_scan_pivot_window", 3)),
-        min_span_bars=int(cfg.get("tri_scan_min_span_bars", 28)),
-        lookback_bars=int(cfg.get("tri_scan_lookback_bars", 200)),
-        min_apex_bars_ahead=int(cfg.get("tri_scan_min_apex_bars_ahead", 1)),
-        max_apex_bars_ahead=int(cfg.get("tri_scan_max_apex_bars_ahead", 40)),
-        max_squeeze_pct=float(cfg.get("tri_scan_max_squeeze_pct", 50.0)),
-    )
-    manager.set_result(
-        job_id,
-        "Üçgen",
-        results,
-        _meta(
-            len(symbols),
-            TRIANGLE_SCAN_PERIOD_LABELS.get(cfg.get("tri_scan_period"), cfg.get("tri_scan_period")),
-            errors,
-            source,
-        ),
-    )
-    return results, errors
+def worker_write_state(job_id: str, state: dict):
+    state = dict(state or {})
+    state["updated_ts"] = _now_ts()
+    state["heartbeat_ts"] = _now_ts()
+    _atomic_write_json(_state_path(job_id), state)
 
 
-def _scan_trend(manager, job_id, symbols, cfg, start=0.0, span=1.0, source="Düşen trend taraması"):
-    errors = []
-    callback = _job_progress(manager, job_id, "Düşen trend taranıyor", start, span)
-    results = scan_trendline_symbols_parallel(
-        symbols,
-        cfg.get("tl_scan_period", "1h"),
-        max_workers=int(cfg.get("max_workers", 20)),
-        use_cache=bool(cfg.get("use_cache", True)),
-        progress_callback=callback,
-        errors_out=errors,
-        pivot_window=int(cfg.get("tl_scan_pivot_window", 3)),
-        min_span_bars=int(cfg.get("tl_scan_min_span_bars", 30)),
-        lookback_bars=int(cfg.get("tl_scan_lookback_bars", 200)),
-        breakout_lookback=int(cfg.get("tl_scan_breakout_lookback", 3)),
-        touch_tolerance_pct=float(cfg.get("tl_scan_touch_tolerance_pct", 1.5)),
-        require_volume=bool(cfg.get("tl_scan_require_volume", True)),
-        volume_factor=float(cfg.get("tl_scan_volume_factor", 1.5)),
-        min_touches=int(cfg.get("tl_scan_min_touches", 3)),
-    )
-    manager.set_result(
-        job_id,
-        "Düşen Trend",
-        results,
-        _meta(
-            len(symbols),
-            TRENDLINE_SCAN_PERIOD_LABELS.get(cfg.get("tl_scan_period"), cfg.get("tl_scan_period")),
-            errors,
-            source,
-        ),
-    )
-    return results, errors
+def worker_read_results(job_id: str):
+    return _read_pickle(_result_path(job_id), default={"result_sets": {}, "result_meta": {}}) or {"result_sets": {}, "result_meta": {}}
 
 
-def _scan_alternation(manager, job_id, symbols, cfg, start=0.0, span=1.0, source="Alternasyon taraması"):
-    errors = []
-    callback = _job_progress(manager, job_id, "Alternasyon taranıyor", start, span)
-    min_score = cfg.get("alt_scan_min_score")
-    if min_score in ("", None):
-        min_score = None
-    else:
-        min_score = float(min_score)
-    results = scan_alternation_symbols_parallel(
-        symbols,
-        cfg.get("alt_scan_period", "monthly"),
-        max_workers=int(cfg.get("max_workers", 20)),
-        use_cache=bool(cfg.get("use_cache", True)),
-        progress_callback=callback,
-        errors_out=errors,
-        min_chain=int(cfg.get("alt_scan_min_chain", 3)),
-        min_score=min_score,
-    )
-    manager.set_result(
-        job_id,
-        "Alternasyon",
-        results,
-        _meta(
-            len(symbols),
-            ALTERNATION_SCAN_PERIOD_LABELS.get(cfg.get("alt_scan_period"), cfg.get("alt_scan_period")),
-            errors,
-            source,
-        ),
-    )
-    return results, errors
+def worker_write_results(job_id: str, payload: dict):
+    _atomic_write_pickle(_result_path(job_id), payload)
 
 
-def _background_scan_worker(manager, job_id, kind, symbols, cfg):
-    try:
-        manager.update(
-            job_id,
-            status="running",
-            started_at=_now_text(),
-            detail=f"{kind} taraması başlıyor...",
-            progress=0.0,
-        )
-        if kind == "VWAP":
-            _scan_vwap(manager, job_id, symbols, cfg)
-        elif kind == "Üçgen":
-            _scan_triangle(manager, job_id, symbols, cfg)
-        elif kind == "Düşen Trend":
-            _scan_trend(manager, job_id, symbols, cfg)
-        elif kind == "Alternasyon":
-            _scan_alternation(manager, job_id, symbols, cfg)
-        elif kind == "Tümünü Tara":
-            _scan_vwap(manager, job_id, symbols, cfg, 0.00, 0.25, source="Tümünü Tara")
-            _scan_triangle(manager, job_id, symbols, cfg, 0.25, 0.25, source="Tümünü Tara")
-            _scan_trend(manager, job_id, symbols, cfg, 0.50, 0.25, source="Tümünü Tara")
-            _scan_alternation(manager, job_id, symbols, cfg, 0.75, 0.25, source="Tümünü Tara")
-        else:
-            raise ValueError(f"Bilinmeyen tarama türü: {kind}")
-        manager.complete(job_id)
-    except Exception as exc:
-        manager.fail(job_id, exc)
+def worker_pid_alive(pid):
+    return _pid_alive(pid)
