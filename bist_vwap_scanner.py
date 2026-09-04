@@ -191,7 +191,7 @@ def main():
         done_count[0] = done
         print(f"\r[{done}/{total}] işlendi...", end="", flush=True)
 
-    matches_raw, sideways_raw, drawdown_raw, alternation_raw, trendline_raw = scan_symbols_parallel(
+    matches_raw, sideways_raw, drawdown_raw, alternation_raw, trendline_raw, triangle_raw = scan_symbols_parallel(
         symbols, args.period, lookback=args.lookback,
         max_workers=args.workers, use_cache=not args.no_cache,
         progress_callback=on_progress, errors_out=fetch_errors,

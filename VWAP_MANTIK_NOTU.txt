@@ -1,0 +1,22 @@
+VWAP MANTIĞI — KORUNAN ORİJİNAL STRATEJİ
+
+Bu sürümde VWAP tarama stratejisi, kullanıcının ilk bist-vwap-arayuz.rar paketindeki mantığa geri döndürülmüştür.
+
+Birebir eski mantığa dönen parçalar:
+- find_recent_crossover
+- determine_first_anchor
+- run_vwap_chain_scan
+- anchored_vwap_series ve find_last_touch zaten orijinalle aynıydı ve korunmuştur.
+- Günlük/haftalık/aylık VWAP veri penceresi: 5y
+- 4 saatlik VWAP veri penceresi: önce 730d; Yahoo vermezse 1y/6mo teknik fallback
+- Mevcut hafta/ay/4h bloğunu strateji açısından otomatik eleme yok (ilk paket davranışı).
+
+Korunan teknik düzeltmeler:
+- Yahoo boş intraday veri için retry/backoff/fallback ve düşük paralellik
+- Timezone / USD-EUR dönüştürme hataları
+- 4 saatlik BIST seans hizalama düzeltmesi
+- Haftalık/aylık grafikte gelecekteki tarih etiketi yerine gerçek işlem tarihi
+- Mobil/masaüstü arayüz ve tablo satırına tıklayarak grafik açma
+- Grafik payload/KeyError düzeltmeleri
+
+ÖNEMLİ: VWAP strateji kuralları açık kullanıcı talebi olmadan değiştirilmemelidir.

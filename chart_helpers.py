@@ -97,10 +97,12 @@ WICK_WIDTH = 0.14
 
 # TradingView'daki gibi: tekerlek = zoom, sürükle = kaydır (pan).
 PLOTLY_CONFIG = {
+    "responsive": True,
     "scrollZoom": True,
     "displaylogo": False,
-    "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-    "doubleClick": "reset",  # grafik içinde çift tık = zoom sıfırla (TradingView mantığı)
+    "displayModeBar": "hover",
+    "modeBarButtonsToRemove": ["lasso2d", "select2d", "zoomIn2d", "zoomOut2d", "autoScale2d"],
+    "doubleClick": "reset",
 }
 
 
@@ -256,16 +258,16 @@ def _finalize_price_volume_axes(fig, tickvals, ticktext, price_range, y_title):
     # Alt panel x ekseni: asıl tarih etiketleri BURADA.
     fig.update_xaxes(
         row=2, col=1,
-        tickvals=tickvals, ticktext=ticktext, tickangle=-45,
+        tickvals=tickvals, ticktext=ticktext, tickangle=-35,
         rangeslider_visible=False, showgrid=False,
-        showticklabels=True, tickfont=dict(size=11), fixedrange=False,
+        showticklabels=True, tickfont=dict(size=10), fixedrange=False,
         showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
         spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
     )
     yaxis_kwargs = dict(
         title_text=y_title,
         side="right",  # TradingView gibi fiyat ekseni sağda
-        showticklabels=True, tickfont=dict(size=11), fixedrange=False,
+        showticklabels=True, tickfont=dict(size=10), fixedrange=False,
         showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
         spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
     )
@@ -281,6 +283,63 @@ def _finalize_price_volume_axes(fig, tickvals, ticktext, price_range, y_title):
         nticks=3, fixedrange=False,
         showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
         spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
+    )
+
+
+def _focus_recent_pattern(fig, n, start_hint=None, end_extra=2, min_bars=55, max_bars=105):
+    """Mobil/dar ekranlarda tüm geçmişi ezmek yerine sinyale yakın bölgeyi gösterir.
+    Kullanıcı pan/zoom ile tüm geçmişe yine ulaşabilir."""
+    if n <= 0:
+        return
+    last = n - 1
+    if start_hint is None:
+        start = max(0, n - max_bars)
+    else:
+        try:
+            start = max(0, int(start_hint) - 8)
+        except Exception:
+            start = max(0, n - max_bars)
+        if last - start + 1 < min_bars:
+            start = max(0, last - min_bars + 1)
+        if last - start + 1 > max_bars:
+            start = max(0, last - max_bars + 1)
+    end = last + max(1, int(end_extra or 0))
+    fig.update_xaxes(range=[start - 0.5, end + 0.5], row=1, col=1)
+    fig.update_xaxes(range=[start - 0.5, end + 0.5], row=2, col=1)
+    return start, min(last, end)
+
+
+def _focused_price_range(df, start_idx, end_idx=None):
+    """Görünen mumlara göre fiyat eksenini sıkılaştırır; telefonda mumları büyütür."""
+    if end_idx is None:
+        end_idx = len(df) - 1
+    start_idx = max(0, int(start_idx or 0))
+    end_idx = min(len(df) - 1, int(end_idx))
+    sub = df.iloc[start_idx:end_idx + 1]
+    if sub.empty:
+        sub = df
+    low = float(sub["Low"].min())
+    high = float(sub["High"].max())
+    pad = max((high - low) * 0.10, high * 0.012, 0.01)
+    return [low - pad, high + pad]
+
+
+def _mobile_friendly_layout(fig, title):
+    """Masaüstünde de temiz, telefonda taşmayan ortak grafik görünümü."""
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=16), x=0.01, xanchor="left"),
+        height=500,
+        template="plotly_white",
+        dragmode="pan",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+            font=dict(size=9), itemwidth=30,
+        ),
+        margin=dict(l=8, r=46, t=72, b=58),
+        bargap=0.0,
+        hovermode="closest",
+        hoverlabel=dict(font_size=11),
+        autosize=True,
     )
 
 
@@ -348,7 +407,7 @@ def render_vwap_chart(sym, r, key=None):
         color = VWAP_COLORS.get(lvl, "#aaaaaa")
         fig.add_trace(go.Scatter(
             x=x, y=level_info["vwap"].values,
-            mode="lines", name=f"VWAP-{lvl} ({level_info['anchor_reason']} @ {level_info['anchor_date']})",
+            mode="lines", name=f"VWAP-{lvl}",
             line=dict(color=color, width=2, dash="solid" if lvl == r["level"] else "dot"),
         ), row=1, col=1)
 
@@ -356,7 +415,7 @@ def render_vwap_chart(sym, r, key=None):
     cross_idx = r["cross_idx"]
     fig.add_trace(go.Scatter(
         x=[cross_idx], y=[df["Close"].iloc[cross_idx]],
-        mode="markers", name="Kırılma Noktası",
+        mode="markers", name="Kırılım",
         marker=dict(color="#e8b545", size=14, symbol="star"),
     ), row=1, col=1)
 
@@ -373,7 +432,7 @@ def render_vwap_chart(sym, r, key=None):
         # "projeksiyon" olduğu görsel olarak ayırt edilsin diye.
         fig.add_trace(go.Scatter(
             x=[x1, x2], y=[slope * x1 + intercept, slope * x2 + intercept],
-            mode="lines", name="Düşen Trend Çizgisi",
+            mode="lines", name="Düşen Trend",
             line=dict(color="#ff5f5f", width=2.5, dash="solid"),
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
@@ -384,12 +443,12 @@ def render_vwap_chart(sym, r, key=None):
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
             x=[tl_cross_idx], y=[df["Close"].iloc[tl_cross_idx]],
-            mode="markers", name="Trend Çizgisi Kırılımı",
+            mode="markers", name="Trend Kırılımı",
             marker=dict(color="#ff5f5f", size=13, symbol="triangle-up"),
         ), row=1, col=1)
 
     # --- Tarih etiketleri (x ekseni tam sayı index olduğu için elle basıyoruz) ---
-    tick_step = max(1, n // 14)
+    tick_step = max(1, n // 7)
     tickvals = x[::tick_step]
     ticktext = [date_fmt(df["Date"].iloc[i]) for i in tickvals]
 
@@ -403,28 +462,17 @@ def render_vwap_chart(sym, r, key=None):
     if trendline_info and trendline_info.get("matched"):
         trend_badge = f" · 📐 Trend Çizgisi Kırılımı ({trendline_info['cross_date']})"
 
-    fig.update_layout(
-        title=f"{sym} — {r['level']}. VWAP Kırılımı ({r['cross_date']}) · Hacim Mumu · {currency_label} bazlı{alt_badge}{trend_badge}",
-        height=560,  # DÜZELTME: 700 -> 560. st.dialog (bkz. app.py) yüksekliği
-        # KONTROL EDEMİYORUZ; tarayıcı görünür alanına göre bir üst sınırı var ve
-        # taşan içerik diyalog İÇİNDE kaydırma çubuğuna dönüyordu ("grafik yarım
-        # açılıyor" ve tekerlek zoom ile geçmişe giderken diyalog kayıyor/mumlar
-        # gözden kayboluyor şikayeti). Grafiği diyaloğun genelde kaydırmadan
-        # sığdığı yüksekliğe küçülterek, tüm geçmiş (equivolume mumları + hacim
-        # paneli) TEK bakışta, kaydırmaya gerek kalmadan görünür kalıyor.
-        template="plotly_dark",
-        dragmode="pan",  # sürükleyerek kaydırma — TradingView mantığı
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        # Alt/sol kenar boşlukları, döndürülmüş tarih etiketleri ve fiyat
-        # etiketleri/başlığı için YETERLİ yer bıraksın diye büyütüldü — eskiden
-        # (l=10, b=10) bu etiketleri kırpıyor, hem görünmez kılıyor hem de
-        # eksenin üzerine tıklayıp genişlik ayarlamak için tutunacak yer
-        # bırakmıyordu.
-        margin=dict(l=20, r=65, t=52, b=78),  # DÜZELTME: dikey boşluk azaltıldı, diyalogda daha fazla yer kalsın diye
-        bargap=0.0,  # genişlikler zaten hacme göre ayarlı, ekstra boşluk istemiyoruz
-        hovermode="x unified",
+    period_label = {
+        "4h": "4 Saat", "daily": "Günlük", "weekly": "Haftalık", "monthly": "Aylık",
+    }.get(r.get("period"), str(r.get("period") or ""))
+    _mobile_friendly_layout(fig, f"{sym} · VWAP-{r['level']} · {period_label}")
+    focus_start = max(0, int(r.get("cross_idx", n - 1)) - 45)
+    view_start, view_end = _focus_recent_pattern(fig, n, start_hint=focus_start, end_extra=2, min_bars=55, max_bars=100)
+    _finalize_price_volume_axes(
+        fig, tickvals, ticktext,
+        price_range=_focused_price_range(df, view_start, view_end),
+        y_title=f"Fiyat ({currency_label})",
     )
-    _finalize_price_volume_axes(fig, tickvals, ticktext, price_range=None, y_title=f"Fiyat ({currency_label})")
 
     st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key=key)
 
@@ -478,7 +526,7 @@ def render_triangle_chart(sym, r, key=None):
     fig.add_trace(go.Scatter(
         x=[upper["x1"], upper["x2"]],
         y=[upper["slope"] * upper["x1"] + upper["intercept"], upper["slope"] * upper["x2"] + upper["intercept"]],
-        mode="lines", name="Üst Çizgi (Direnç)",
+        mode="lines", name="Direnç",
         line=dict(color="#ff5f5f", width=2.5, dash="solid"),
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
@@ -490,7 +538,7 @@ def render_triangle_chart(sym, r, key=None):
     fig.add_trace(go.Scatter(
         x=[lower["x1"], lower["x2"]],
         y=[lower["slope"] * lower["x1"] + lower["intercept"], lower["slope"] * lower["x2"] + lower["intercept"]],
-        mode="lines", name="Alt Çizgi (Destek)",
+        mode="lines", name="Destek",
         line=dict(color="#3ddc84", width=2.5, dash="solid"),
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
@@ -503,11 +551,11 @@ def render_triangle_chart(sym, r, key=None):
     # --- Apex noktası (henüz gelmemiş kırılım/kesişim noktası) ---
     fig.add_trace(go.Scatter(
         x=[apex_x], y=[r["apex_y"]],
-        mode="markers", name=f"Apex (~{r['apex_bars_ahead']:.0f} bar sonra)",
+        mode="markers", name="Apex",
         marker=dict(color="#e8b545", size=13, symbol="x"),
     ), row=1, col=1)
 
-    tick_step = max(1, n // 14)
+    tick_step = max(1, n // 7)
     tickvals = x[::tick_step]
     ticktext = [date_fmt(df["Date"].iloc[i]) for i in tickvals]
 
@@ -517,25 +565,10 @@ def render_triangle_chart(sym, r, key=None):
     vol_dryness = r.get("volume_dryness_pct")
     vol_badge = f" · 💧 Hacim %{vol_dryness:.0f}'e düştü" if vol_dryness is not None else ""
 
-    fig.update_layout(
-        title=(f"{sym} — {r['pattern_type']} · Kırılmak Üzere ({period_label}) · "
-               f"Sıkışma %{r['squeeze_pct']:.0f} · Apex ~{r['apex_bars_ahead']:.0f} bar sonra"
-               f"{vol_badge}"),
-        height=560,  # DÜZELTME: 700 -> 560. st.dialog (bkz. app.py) yüksekliği
-        # KONTROL EDEMİYORUZ; tarayıcı görünür alanına göre bir üst sınırı var ve
-        # taşan içerik diyalog İÇİNDE kaydırma çubuğuna dönüyordu ("grafik yarım
-        # açılıyor" ve tekerlek zoom ile geçmişe giderken diyalog kayıyor/mumlar
-        # gözden kayboluyor şikayeti). Grafiği diyaloğun genelde kaydırmadan
-        # sığdığı yüksekliğe küçülterek, tüm geçmiş (equivolume mumları + hacim
-        # paneli) TEK bakışta, kaydırmaya gerek kalmadan görünür kalıyor.
-        template="plotly_dark",
-        dragmode="pan",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=20, r=65, t=52, b=78),  # DÜZELTME: dikey boşluk azaltıldı, diyalogda daha fazla yer kalsın diye
-        bargap=0.0,
-        hovermode="x unified",
-    )
-
+    _mobile_friendly_layout(fig, f"{sym} · {r['pattern_type']} · {period_label}")
+    pattern_start = min(int(upper.get("x1", 0)), int(lower.get("x1", 0)))
+    extra = min(8, max(2, int(r.get("apex_bars_ahead") or 2)))
+    view_start, view_end = _focus_recent_pattern(fig, n, start_hint=pattern_start, end_extra=extra, min_bars=55, max_bars=105)
     # --- Y ekseni aralığını MUMLARIN kendi fiyat aralığına göre SABİTLE ---
     # Apex noktası/uzantısı ileri bir bara projekte edildiği için, eğim dik
     # olduğunda (örn. sıkışmış küçük bir pivot aralığından hesaplanan eğim
@@ -547,12 +580,9 @@ def render_triangle_chart(sym, r, key=None):
     # sabitliyoruz; apex çok uzaktaysa çizginin ucu ekranın dışına taşabilir
     # ama üçgenin kendisi (pivot noktalarından gelen gerçek segment) her
     # zaman görünür kalır.
-    price_low = float(df["Low"].min())
-    price_high = float(df["High"].max())
-    price_pad = max((price_high - price_low) * 0.08, price_high * 0.01, 0.01)
     _finalize_price_volume_axes(
         fig, tickvals, ticktext,
-        price_range=[price_low - price_pad, price_high + price_pad],
+        price_range=_focused_price_range(df, view_start, view_end),
         y_title="Fiyat (TL)",
     )
 
@@ -603,7 +633,7 @@ def render_trendline_chart(sym, r, key=None):
 
     fig.add_trace(go.Scatter(
         x=[x1, x2], y=[slope * x1 + intercept, slope * x2 + intercept],
-        mode="lines", name="Düşen Trend Çizgisi",
+        mode="lines", name="Düşen Trend",
         line=dict(color="#ff5f5f", width=2.5, dash="solid"),
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
@@ -614,12 +644,12 @@ def render_trendline_chart(sym, r, key=None):
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
         x=[cross_idx], y=[df["Close"].iloc[cross_idx]],
-        mode="markers", name="Trend Çizgisi Kırılımı",
+        mode="markers", name="Trend Kırılımı",
         marker=dict(color="#ff5f5f", size=14, symbol="triangle-up"),
     ), row=1, col=1)
 
     # --- Tarih etiketleri ---
-    tick_step = max(1, n // 14)
+    tick_step = max(1, n // 7)
     tickvals = x[::tick_step]
     ticktext = [date_fmt(df["Date"].iloc[i]) for i in tickvals]
 
@@ -628,34 +658,16 @@ def render_trendline_chart(sym, r, key=None):
     }.get(r.get("period"), r.get("period", ""))
     vol_badge = " · ✅ Hacim Teyitli" if r.get("volume_confirmed") else ""
 
-    fig.update_layout(
-        title=(f"{sym} — Düşen Trend Çizgisi Kırılımı ({r['cross_date']}) · {period_label} · "
-               f"Hacim Mumu · {r['touches']} temas{vol_badge}"),
-        height=560,  # DÜZELTME: 700 -> 560. st.dialog (bkz. app.py) yüksekliği
-        # KONTROL EDEMİYORUZ; tarayıcı görünür alanına göre bir üst sınırı var ve
-        # taşan içerik diyalog İÇİNDE kaydırma çubuğuna dönüyordu ("grafik yarım
-        # açılıyor" ve tekerlek zoom ile geçmişe giderken diyalog kayıyor/mumlar
-        # gözden kayboluyor şikayeti). Grafiği diyaloğun genelde kaydırmadan
-        # sığdığı yüksekliğe küçülterek, tüm geçmiş (equivolume mumları + hacim
-        # paneli) TEK bakışta, kaydırmaya gerek kalmadan görünür kalıyor.
-        template="plotly_dark",
-        dragmode="pan",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=20, r=65, t=52, b=78),  # DÜZELTME: dikey boşluk azaltıldı, diyalogda daha fazla yer kalsın diye
-        bargap=0.0,
-        hovermode="x unified",
-    )
+    _mobile_friendly_layout(fig, f"{sym} · Düşen Trend Kırılımı · {period_label}")
+    view_start, view_end = _focus_recent_pattern(fig, n, start_hint=int(line.get("x1", 0)), end_extra=2, min_bars=55, max_bars=105)
     # --- Y ekseni aralığını MUMLARIN kendi fiyat aralığına göre SABİTLE ---
     # (bkz. render_triangle_chart'taki aynı isimli blok) — kırılım
     # uzantısı çok dik bir eğimde bugüne yansıtılırsa autorange bunu tek
     # başına referans alıp mumları ekranın kenarına sıkıştırabilir; bu
     # yüzden ekseni mumların gerçek High/Low'una göre sabitliyoruz.
-    price_low = float(df["Low"].min())
-    price_high = float(df["High"].max())
-    price_pad = max((price_high - price_low) * 0.08, price_high * 0.01, 0.01)
     _finalize_price_volume_axes(
         fig, tickvals, ticktext,
-        price_range=[price_low - price_pad, price_high + price_pad],
+        price_range=_focused_price_range(df, view_start, view_end),
         y_title="Fiyat (TL)",
     )
 
@@ -717,13 +729,13 @@ def render_alternation_chart(sym, r, key=None):
     chain_x = list(range(start_idx, end_idx + 1))
     chain_y = [float(df["Close"].iloc[i]) for i in chain_x]
     fig.add_trace(go.Scatter(
-        x=chain_x, y=chain_y, mode="lines+markers", name="Alternasyon Zinciri",
+        x=chain_x, y=chain_y, mode="lines+markers", name="Alternasyon",
         line=dict(color="#f5c542", width=1.5, dash="dot"),
         marker=dict(color="#f5c542", size=5),
     ), row=1, col=1)
 
     # --- Tarih etiketleri ---
-    tick_step = max(1, n // 14)
+    tick_step = max(1, n // 7)
     tickvals = x[::tick_step]
     ticktext = [date_fmt(df["Date"].iloc[i]) for i in tickvals]
 
@@ -731,29 +743,11 @@ def render_alternation_chart(sym, r, key=None):
         "1h": "1 Saatlik", "4h": "4 Saatlik", "daily": "Günlük", "weekly": "Haftalık", "monthly": "Aylık",
     }.get(r.get("period"), r.get("period", ""))
 
-    fig.update_layout(
-        title=(f"{sym} — Alternasyon (Zigzag) · {period_label} · "
-               f"{r['chain_length']} mum · Düzenlilik Puanı {r['score']:.0f}"),
-        height=560,  # DÜZELTME: 700 -> 560. st.dialog (bkz. app.py) yüksekliği
-        # KONTROL EDEMİYORUZ; tarayıcı görünür alanına göre bir üst sınırı var ve
-        # taşan içerik diyalog İÇİNDE kaydırma çubuğuna dönüyordu ("grafik yarım
-        # açılıyor" ve tekerlek zoom ile geçmişe giderken diyalog kayıyor/mumlar
-        # gözden kayboluyor şikayeti). Grafiği diyaloğun genelde kaydırmadan
-        # sığdığı yüksekliğe küçülterek, tüm geçmiş (equivolume mumları + hacim
-        # paneli) TEK bakışta, kaydırmaya gerek kalmadan görünür kalıyor.
-        template="plotly_dark",
-        dragmode="pan",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=20, r=65, t=52, b=78),  # DÜZELTME: dikey boşluk azaltıldı, diyalogda daha fazla yer kalsın diye
-        bargap=0.0,
-        hovermode="x unified",
-    )
-    price_low = float(df["Low"].min())
-    price_high = float(df["High"].max())
-    price_pad = max((price_high - price_low) * 0.08, price_high * 0.01, 0.01)
+    _mobile_friendly_layout(fig, f"{sym} · Alternasyon · {period_label}")
+    view_start, view_end = _focus_recent_pattern(fig, n, start_hint=max(0, int(start_idx) - 20), end_extra=2, min_bars=55, max_bars=95)
     _finalize_price_volume_axes(
         fig, tickvals, ticktext,
-        price_range=[price_low - price_pad, price_high + price_pad],
+        price_range=_focused_price_range(df, view_start, view_end),
         y_title="Fiyat (TL)",
     )
 
