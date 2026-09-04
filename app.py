@@ -519,7 +519,7 @@ def render_chart_page_if_requested():
         "trendline": "Düşen Trend Kırılımı",
         "alternation": "Alternasyon",
     }
-    st.title(f"{sym} · {title_map.get(kind, 'Grafik')}")
+    # Grafik ekranında başlık tekrarını kaldır: mobilde alanı doğrudan grafiğe bırak.
     render_quality_panel(result, compact=True)
 
     if not chart_payload_complete(kind, result):
