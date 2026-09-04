@@ -48,6 +48,7 @@ from chart_helpers import (
     render_trendline_chart,
     render_vwap_chart,
 )
+from scan_jobs import get_scan_job_manager
 
 # Yukarıdaki koşullu import ifadesi yalnız eski sabit adıyla uyumluluk için yazılmıştır;
 # Python import listesinde koşul kullanılamaz. Bu satır dosya oluşturulurken aşağıda temizlenir.
@@ -272,6 +273,118 @@ def set_page(page, scan_type=None, result_focus=None):
     st.rerun()
 
 
+
+# -----------------------------------------------------------------------------
+# Mobil / bağlantı kopmasına dayanıklı arka plan taraması
+# -----------------------------------------------------------------------------
+def _job_query_id():
+    try:
+        value = st.query_params.get("job")
+        if isinstance(value, (list, tuple)):
+            value = value[-1] if value else None
+        return str(value).strip() if value else None
+    except Exception:
+        return None
+
+
+def _attach_job(job_id):
+    if not job_id:
+        return
+    st.session_state["_active_job_id"] = str(job_id)
+    try:
+        st.query_params["job"] = str(job_id)
+    except Exception:
+        pass
+
+
+def _sync_job_results(snapshot):
+    if not snapshot:
+        return False
+    ensure_result_store()
+    changed = False
+    for name, rows in (snapshot.get("result_sets") or {}).items():
+        if st.session_state._result_sets.get(name) is not rows:
+            st.session_state._result_sets[name] = rows
+            changed = True
+    for name, meta in (snapshot.get("result_meta") or {}).items():
+        st.session_state._result_meta[name] = meta
+        changed = True
+    st.session_state["_synced_job_revision"] = int(snapshot.get("revision") or 0)
+    return changed
+
+
+def _resolve_job_snapshot(auto_attach_running=True):
+    manager = get_scan_job_manager()
+    job_id = _job_query_id() or st.session_state.get("_active_job_id")
+    snap = manager.snapshot(job_id) if job_id else None
+    if not snap and auto_attach_running:
+        # Mobil tarayıcı URL query parametresini kaybetmişse sunucuda hâlâ devam
+        # eden tek taramaya yeniden bağlan. Bu uygulama tek tarama işini aynı
+        # anda çalıştırdığı için güvenli ve kullanıcı dostu bir geri kazanımdır.
+        snap = manager.active_snapshot()
+        if snap:
+            _attach_job(snap.get("id"))
+    if snap:
+        _attach_job(snap.get("id"))
+        revision = int(snap.get("revision") or 0)
+        if revision != int(st.session_state.get("_synced_job_revision") or -1):
+            _sync_job_results(snap)
+    return snap
+
+
+def _clear_results_for_job(kind):
+    ensure_result_store()
+    targets = ["VWAP", "Üçgen", "Düşen Trend", "Alternasyon"] if kind == "Tümünü Tara" else [kind]
+    for name in targets:
+        st.session_state._result_sets.pop(name, None)
+        st.session_state._result_meta.pop(name, None)
+
+
+def launch_background_scan(kind, symbols, cfg, result_focus=None):
+    manager = get_scan_job_manager()
+    _clear_results_for_job(kind)
+    job_id, started = manager.start(kind, list(symbols), dict(cfg))
+    _attach_job(job_id)
+    st.session_state["_synced_job_revision"] = -1
+    st.session_state["_app_page"] = "Sonuçlar"
+    st.session_state["_results_focus"] = result_focus or ("Özet" if kind == "Tümünü Tara" else kind)
+    if not started:
+        st.session_state["_job_start_notice"] = "Sunucuda zaten devam eden bir tarama vardı; ona yeniden bağlandım."
+    st.rerun()
+
+
+@st.fragment(run_every=2.0)
+def render_live_scan_status():
+    snap = _resolve_job_snapshot(auto_attach_running=True)
+    if not snap:
+        return
+    status = snap.get("status")
+    progress = float(snap.get("progress") or 0.0)
+    kind = snap.get("kind") or "Tarama"
+    detail = snap.get("detail") or ""
+
+    if status in {"queued", "running"}:
+        st.info(f"📡 **{kind} arka planda devam ediyor.** Telefon ekranını kapatabilir veya başka uygulamaya geçebilirsin; geri geldiğinde aynı işe bağlanırsın.")
+        st.progress(max(0.0, min(1.0, progress)), text=detail or f"{kind} sürüyor...")
+        st.caption(f"İş no: {snap.get('id')} · Başlangıç: {snap.get('started_at') or 'hazırlanıyor'}")
+        return
+
+    revision = int(snap.get("revision") or 0)
+    seen_key = f"{snap.get('id')}:{revision}:{status}"
+    if st.session_state.get("_job_terminal_seen") != seen_key:
+        _sync_job_results(snap)
+        st.session_state["_job_terminal_seen"] = seen_key
+        # Tam sayfayı bir kez yenileyerek sonuç tablolarının da yeni veriyi
+        # hemen görmesini sağla. Sonraki fragment turlarında tekrar etmez.
+        st.rerun()
+
+    if status == "completed":
+        total_found = sum(len(v or []) for v in (snap.get("result_sets") or {}).values())
+        st.success(f"✅ **{kind} tamamlandı.** Toplam {total_found} eşleşme bulundu. Sonuçlar aşağıda.")
+    elif status == "failed":
+        st.error(f"❌ **{kind} taraması durdu:** {snap.get('error') or 'Bilinmeyen hata'}")
+
+
 # -----------------------------------------------------------------------------
 # Grafik sayfası
 # -----------------------------------------------------------------------------
@@ -489,10 +602,14 @@ def render_results_page():
     st.caption("Bütün taramaların sonuçları tek yerde. Tablo satırına tıklayınca ilgili hisse grafiği açılır.")
 
     names = ["VWAP", "Üçgen", "Düşen Trend", "Alternasyon"]
+    active_job = _resolve_job_snapshot(auto_attach_running=True)
     if not any(sets.get(n) is not None for n in names):
-        st.info("Henüz tarama sonucu yok. Tarama sayfasından bir tarama başlatın.")
-        if st.button("🔎 Tarama sayfasına git", type="primary", width="stretch"):
-            set_page("Tarama")
+        if active_job and active_job.get("status") in {"queued", "running"}:
+            st.info("Tarama sunucuda devam ediyor. Bu sayfayı kapatsan bile iş devam edecek; sonuçlar tamamlanınca burada görünecek.")
+        else:
+            st.info("Henüz tarama sonucu yok. Tarama sayfasından bir tarama başlatın.")
+            if st.button("🔎 Tarama sayfasına git", type="primary", width="stretch"):
+                set_page("Tarama")
         return
 
     cols = st.columns(4)
@@ -894,10 +1011,7 @@ def render_scan_page():
         })
         cfg = load_settings()
         if st.button(f"🔍 VWAP Tara · {len(symbols)} hisse", type="primary", width="stretch"):
-            progress = st.progress(0.0, text="VWAP taraması başlıyor...")
-            run_vwap_scan(symbols, cfg, progress)
-            progress.progress(1.0, text="VWAP taraması tamamlandı.")
-            set_page("Sonuçlar", result_focus="VWAP")
+            launch_background_scan("VWAP", symbols, cfg, result_focus="VWAP")
 
     elif selected == "Üçgen":
         st.markdown("### 🔺 Üçgen Taraması")
@@ -928,10 +1042,7 @@ def render_scan_page():
         save_partial_settings({"tri_scan_period": tri_period, **tri_vals})
         cfg = load_settings()
         if st.button(f"🔍 Üçgen Tara · {len(symbols)} hisse", type="primary", width="stretch"):
-            progress = st.progress(0.0, text="Üçgen taraması başlıyor...")
-            run_triangle_scan(symbols, cfg, progress)
-            progress.progress(1.0, text="Üçgen taraması tamamlandı.")
-            set_page("Sonuçlar", result_focus="Üçgen")
+            launch_background_scan("Üçgen", symbols, cfg, result_focus="Üçgen")
 
     elif selected == "Düşen Trend":
         st.markdown("### 📉 Düşen Trend Kırılımı")
@@ -969,10 +1080,7 @@ def render_scan_page():
         save_partial_settings({"tl_scan_period": tl_period, "tl_scan_require_volume": tl_volume, **tl_vals})
         cfg = load_settings()
         if st.button(f"🔍 Düşen Trend Tara · {len(symbols)} hisse", type="primary", width="stretch"):
-            progress = st.progress(0.0, text="Düşen trend taraması başlıyor...")
-            run_trend_scan(symbols, cfg, progress)
-            progress.progress(1.0, text="Düşen trend taraması tamamlandı.")
-            set_page("Sonuçlar", result_focus="Düşen Trend")
+            launch_background_scan("Düşen Trend", symbols, cfg, result_focus="Düşen Trend")
 
     elif selected == "Alternasyon":
         st.markdown("### 🔀 Alternasyon Taraması")
@@ -991,10 +1099,7 @@ def render_scan_page():
         save_partial_settings({"alt_scan_period": alt_period, "alt_scan_min_chain": alt_chain, "alt_scan_min_score": None if alt_score == 0 else alt_score})
         cfg = load_settings()
         if st.button(f"🔍 Alternasyon Tara · {len(symbols)} hisse", type="primary", width="stretch"):
-            progress = st.progress(0.0, text="Alternasyon taraması başlıyor...")
-            run_alternation_scan(symbols, cfg, progress)
-            progress.progress(1.0, text="Alternasyon taraması tamamlandı.")
-            set_page("Sonuçlar", result_focus="Alternasyon")
+            launch_background_scan("Alternasyon", symbols, cfg, result_focus="Alternasyon")
 
     else:  # Tümünü Tara
         st.markdown("### 🚀 Tümünü Birlikte Tara")
@@ -1007,13 +1112,7 @@ def render_scan_page():
         ])
         st.dataframe(summary_df, width="stretch", hide_index=True)
         if st.button(f"🚀 Dördünü Tara · {len(symbols)} hisse", type="primary", width="stretch"):
-            progress = st.progress(0.0, text="Toplu tarama başlıyor...")
-            run_vwap_scan(symbols, cfg, progress, 0.00, 0.25, source="Tümünü Tara")
-            run_triangle_scan(symbols, cfg, progress, 0.25, 0.25, source="Tümünü Tara")
-            run_trend_scan(symbols, cfg, progress, 0.50, 0.25, source="Tümünü Tara")
-            run_alternation_scan(symbols, cfg, progress, 0.75, 0.25, source="Tümünü Tara")
-            progress.progress(1.0, text="Dört tarama tamamlandı.")
-            set_page("Sonuçlar", result_focus="Özet")
+            launch_background_scan("Tümünü Tara", symbols, cfg, result_focus="Özet")
 
 
 # -----------------------------------------------------------------------------
@@ -1022,7 +1121,10 @@ def render_scan_page():
 st.session_state.setdefault("_app_page", "Ana Sayfa")
 st.session_state.setdefault("_scan_type", "VWAP")
 st.session_state.setdefault("_results_focus", "Özet")
+st.session_state.setdefault("_active_job_id", None)
+st.session_state.setdefault("_synced_job_revision", -1)
 ensure_result_store()
+_resolve_job_snapshot(auto_attach_running=True)
 
 if render_chart_page_if_requested():
     st.stop()
@@ -1044,6 +1146,11 @@ with st.container(border=True):
             if st.session_state._app_page != "Sonuçlar":
                 set_page("Sonuçlar")
 st.markdown('<div class="nav-spacer"></div>', unsafe_allow_html=True)
+
+notice = st.session_state.pop("_job_start_notice", None)
+if notice:
+    st.info(notice)
+render_live_scan_status()
 
 page = st.session_state._app_page
 if page == "Ana Sayfa":
