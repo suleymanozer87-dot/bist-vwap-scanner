@@ -504,7 +504,7 @@ def render_chart_page_if_requested():
     if not view:
         return False
 
-    if st.button("← Sonuçlara dön", type="secondary", width="stretch"):
+    if st.button("← Sonuçlar", type="secondary", width="content"):
         st.session_state.pop("_chart_page", None)
         st.session_state["_app_page"] = "Sonuçlar"
         st.rerun()
@@ -519,8 +519,7 @@ def render_chart_page_if_requested():
         "trendline": "Düşen Trend Kırılımı",
         "alternation": "Alternasyon",
     }
-    # Grafik ekranında başlık tekrarını kaldır: mobilde alanı doğrudan grafiğe bırak.
-    render_quality_panel(result, compact=True)
+    # TradingView benzeri sade grafik ekranı: üstte ekstra puan kartı/başlık yok.
 
     if not chart_payload_complete(kind, result):
         st.error((result or {}).get("_chart_repair_error") or "Grafik için gerekli veri bulunamadı. İlgili taramayı yeniden çalıştırın.")

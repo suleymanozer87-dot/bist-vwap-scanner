@@ -1,3 +1,9 @@
+# V5.2 — TradingView Lightweight Charts grafik motoru
+
+Grafik katmanı artık el yapımı Canvas değil, TradingView Lightweight Charts 5.2.1 kullanır. Mobilde native pinch, gövdede yatay+dikey sürükleme, sağ fiyat ekseni scale ve alt zaman ekseni scale aktiftir. Ayrı hacim paneli yoktur; hacim normal fiyat mumunun gövde genişliğine yansır. VWAP ve tarama mantığı değiştirilmemiştir.
+
+---
+
 # BIST Teknik Tarayıcı — V4 Sade Arayüz
 
 ## Nasıl açılır?
