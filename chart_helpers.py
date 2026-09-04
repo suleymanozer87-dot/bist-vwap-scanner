@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-chart_helpers.py — V5.2 TradingView Lightweight Charts tabanlı grafik motoru.
+chart_helpers.py — V5.3 TradingView gesture kontrollü grafik motoru.
 
 Amaç:
 - Grafik etkileşimini el yapımı canvas gesture kodundan çıkarıp TradingView'in
@@ -274,9 +274,9 @@ def _render_lwc_chart(spec: Dict[str, Any], key: Optional[str] = None, height: i
       leftPriceScale:{visible:false},
       timeScale:{visible:true,borderVisible:false,timeVisible:intraday,secondsVisible:false,barSpacing:mobile?5.8:7.0,minBarSpacing:1.2,rightOffsetPixels:mobile?12:18,fixLeftEdge:false,fixRightEdge:false,lockVisibleTimeRangeOnResize:false},
       crosshair:{mode:LWC.CrosshairMode.Normal,vertLine:{color:'#aeb6c2',width:1,style:LWC.LineStyle.Dashed,labelVisible:false},horzLine:{color:'#aeb6c2',width:1,style:LWC.LineStyle.Dashed,labelVisible:true,labelBackgroundColor:'#4b5563'}},
-      handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:true},
-      handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:{time:true,price:true},axisDoubleClickReset:{time:true,price:true}},
-      kineticScroll:{mouse:true,touch:true},
+      handleScroll:false,
+      handleScale:false,
+      kineticScroll:{mouse:false,touch:false},
       trackingMode:{exitMode:LWC.TrackingModeExitMode.OnTouchEnd},
       localization:{
         locale:'tr-TR',
@@ -347,12 +347,191 @@ def _render_lwc_chart(spec: Dict[str, Any], key: Optional[str] = None, height: i
     const f=spec.focus||[Math.max(0,candles.length-80),candles.length+1];
     try{chart.timeScale().setVisibleLogicalRange({from:Number(f[0]),to:Number(f[1])});}catch(_e){chart.timeScale().fitContent();}
 
-    // iOS'ta iframe içindeki chart'ın sayfa scroll'una gesture bırakmasını engeller.
+    // ------------------------------------------------------------------
+    // V5.3 — TradingView benzeri deterministik gesture katmanı.
+    // Lightweight Charts native gesture'ları iframe/iOS kombinasyonunda aynı
+    // davranışı vermediği için public time/price range API'leri ile yönetilir.
+    // Gövde: X+Y pan | sağ eksen: Y scale | alt eksen: X scale | pinch: X+Y zoom.
+    // ------------------------------------------------------------------
+    const root=document.getElementById(ROOT+'_root');
+    root.style.touchAction='none';
     container.style.touchAction='none';
-    container.addEventListener('touchmove',e=>{if(e.touches&&e.touches.length>1)e.preventDefault();},{passive:false});
+    root.style.userSelect='none';
+    root.style.webkitUserSelect='none';
+    root.style.webkitTouchCallout='none';
 
-    // Tanılama: deploy sonrası gesture ayarlarının gerçekten aktif olup olmadığını konsoldan kontrol edebiliriz.
-    window.__bistLwcDebug={chart,baseSeries,options:{handleScroll:true,handleScale:true},version:LWC.version?.()||'5.2.x'};
+    const tScale=chart.timeScale();
+    const pScale=chart.priceScale('right');
+    let lastManualPriceRange=null;
+
+    function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+    function cloneRange(r){return r?{from:Number(r.from),to:Number(r.to)}:null;}
+    function plotMetrics(){
+      const rw=root.clientWidth||container.clientWidth||320;
+      const rh=root.clientHeight||container.clientHeight||650;
+      const pw=Math.max(46,Number(pScale.width?.()||58));
+      const th=Math.max(24,Number(tScale.height?.()||28));
+      return {rw,rh,pw,th,plotW:Math.max(80,rw-pw),plotH:Math.max(100,rh-th)};
+    }
+    function logicalRange(){
+      const r=tScale.getVisibleLogicalRange?.();
+      if(r&&Number.isFinite(r.from)&&Number.isFinite(r.to))return cloneRange(r);
+      return {from:Math.max(0,candles.length-80),to:candles.length+1};
+    }
+    function inferredPriceRange(){
+      const lr=logicalRange();
+      const lo=Math.floor(lr.from)-2, hi=Math.ceil(lr.to)+2;
+      let mn=Infinity,mx=-Infinity;
+      for(let i=Math.max(0,lo);i<Math.min(candles.length,hi);i++){
+        const c=candles[i]; if(!c)continue;
+        mn=Math.min(mn,Number(c.low)); mx=Math.max(mx,Number(c.high));
+      }
+      if(!Number.isFinite(mn)||!Number.isFinite(mx)||mx<=mn){mn=last*.95;mx=last*1.05;}
+      const pad=Math.max((mx-mn)*.08,Math.abs(mx)*.003,1e-6);
+      return {from:mn-pad,to:mx+pad};
+    }
+    function priceRange(){
+      const r=pScale.getVisibleRange?.();
+      if(r&&Number.isFinite(r.from)&&Number.isFinite(r.to)&&r.to>r.from){lastManualPriceRange=cloneRange(r);return cloneRange(r);}
+      return lastManualPriceRange?cloneRange(lastManualPriceRange):inferredPriceRange();
+    }
+    function setPriceRange(r){
+      if(!r||!Number.isFinite(r.from)||!Number.isFinite(r.to)||r.to<=r.from)return;
+      const mid=(r.from+r.to)/2;
+      const minSpan=Math.max(Math.abs(mid)*1e-6,1e-7);
+      if(r.to-r.from<minSpan){r={from:mid-minSpan/2,to:mid+minSpan/2};}
+      pScale.setAutoScale(false);
+      pScale.setVisibleRange(r);
+      lastManualPriceRange=cloneRange(r);
+    }
+    function setLogicalRange(r){
+      if(!r||!Number.isFinite(r.from)||!Number.isFinite(r.to)||r.to<=r.from)return;
+      let span=clamp(r.to-r.from,6,Math.max(20,candles.length*3));
+      const mid=(r.from+r.to)/2;
+      tScale.setVisibleLogicalRange({from:mid-span/2,to:mid+span/2});
+    }
+    function zoneAt(x,y){
+      const m=plotMetrics();
+      if(x>=m.plotW)return 'price';
+      if(y>=m.plotH)return 'time';
+      return 'pane';
+    }
+    function pan2D(startLR,startPR,dx,dy){
+      const m=plotMetrics();
+      const lspan=startLR.to-startLR.from;
+      const pspan=startPR.to-startPR.from;
+      const shiftBars=-(dx/m.plotW)*lspan;
+      // Parmak aşağı -> mumlar aşağı: görünür fiyat aralığını yukarı kaydır.
+      const shiftPrice=(dy/m.plotH)*pspan;
+      setLogicalRange({from:startLR.from+shiftBars,to:startLR.to+shiftBars});
+      setPriceRange({from:startPR.from+shiftPrice,to:startPR.to+shiftPrice});
+    }
+    function scaleTime(startLR,dx,anchorX){
+      const m=plotMetrics();
+      const span=startLR.to-startLR.from;
+      // Alt eksen sağa sürüklenirse daha fazla bar görünür; sola sürüklenirse yaklaşır.
+      const factor=clamp(Math.exp(dx/220),.18,5.5);
+      const frac=clamp(anchorX/m.plotW,0,1);
+      const pivot=startLR.from+span*frac;
+      const ns=clamp(span*factor,6,Math.max(20,candles.length*3));
+      setLogicalRange({from:pivot-ns*frac,to:pivot+ns*(1-frac)});
+    }
+    function scalePrice(startPR,dy,anchorY){
+      const m=plotMetrics();
+      const span=startPR.to-startPR.from;
+      // Sağ eksen yukarı sürükle -> zoom in; aşağı -> zoom out.
+      const factor=clamp(Math.exp(dy/220),.16,6.0);
+      const frac=clamp(anchorY/m.plotH,0,1); // top=0
+      const pivot=startPR.to-span*frac;
+      const ns=Math.max(Math.abs(pivot)*1e-7,span*factor);
+      setPriceRange({from:pivot-ns*(1-frac),to:pivot+ns*frac});
+    }
+    function pinchBoth(startLR,startPR,startTouches,curTouches){
+      const m=plotMetrics();
+      const a0=startTouches[0],b0=startTouches[1],a=curTouches[0],b=curTouches[1];
+      const sx0=Math.max(10,Math.abs(b0.x-a0.x)), sy0=Math.max(10,Math.abs(b0.y-a0.y));
+      const sx=Math.max(10,Math.abs(b.x-a.x)), sy=Math.max(10,Math.abs(b.y-a.y));
+      const d0=Math.max(20,Math.hypot(b0.x-a0.x,b0.y-a0.y));
+      const d=Math.max(20,Math.hypot(b.x-a.x,b.y-a.y));
+      const general=clamp(d0/d,.18,5.5);
+      // Yatay/vertical ayrışma zayıfsa genel pinch oranını kullan.
+      const fx=clamp((sx0>=24&&sx>=24)?sx0/sx:general,.18,5.5);
+      const fy=clamp((sy0>=24&&sy>=24)?sy0/sy:general,.18,5.5);
+      const cx=(a.x+b.x)/2, cy=(a.y+b.y)/2;
+      const lspan=startLR.to-startLR.from, pspan=startPR.to-startPR.from;
+      const xf=clamp(cx/m.plotW,0,1), yf=clamp(cy/m.plotH,0,1);
+      const lpivot=startLR.from+lspan*xf;
+      const ppivot=startPR.to-pspan*yf;
+      const lnew=clamp(lspan*fx,6,Math.max(20,candles.length*3));
+      const pnew=Math.max(Math.abs(ppivot)*1e-7,pspan*fy);
+      setLogicalRange({from:lpivot-lnew*xf,to:lpivot+lnew*(1-xf)});
+      setPriceRange({from:ppivot-pnew*(1-yf),to:ppivot+pnew*yf});
+    }
+
+    function localTouch(t){const r=root.getBoundingClientRect();return {id:t.identifier,x:t.clientX-r.left,y:t.clientY-r.top};}
+    let gesture=null;
+    root.addEventListener('touchstart',e=>{
+      if(!e.touches?.length)return;
+      const ts=Array.from(e.touches).map(localTouch);
+      if(ts.length>=2){
+        gesture={kind:'pinch',startTouches:ts.slice(0,2),startLR:logicalRange(),startPR:priceRange()};
+      }else{
+        const p=ts[0]; gesture={kind:zoneAt(p.x,p.y),x:p.x,y:p.y,startLR:logicalRange(),startPR:priceRange()};
+      }
+      e.preventDefault();
+    },{passive:false,capture:true});
+    root.addEventListener('touchmove',e=>{
+      if(!gesture||!e.touches?.length)return;
+      const ts=Array.from(e.touches).map(localTouch);
+      if(gesture.kind==='pinch'&&ts.length>=2){pinchBoth(gesture.startLR,gesture.startPR,gesture.startTouches,ts.slice(0,2));}
+      else if(ts.length===1){
+        const p=ts[0],dx=p.x-gesture.x,dy=p.y-gesture.y;
+        if(gesture.kind==='pane')pan2D(gesture.startLR,gesture.startPR,dx,dy);
+        else if(gesture.kind==='price')scalePrice(gesture.startPR,dy,gesture.y);
+        else if(gesture.kind==='time')scaleTime(gesture.startLR,dx,gesture.x);
+      }
+      e.preventDefault(); e.stopPropagation();
+    },{passive:false,capture:true});
+    root.addEventListener('touchend',e=>{if(!e.touches?.length)gesture=null;},{passive:false,capture:true});
+    root.addEventListener('touchcancel',()=>{gesture=null;},{passive:false,capture:true});
+
+    // PC: aynı üç bölge mouse ile de çalışsın.
+    let mouseGesture=null;
+    root.addEventListener('pointerdown',e=>{
+      if(e.pointerType==='touch')return;
+      const r=root.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
+      mouseGesture={kind:zoneAt(x,y),x,y,startLR:logicalRange(),startPR:priceRange()};
+      try{root.setPointerCapture(e.pointerId);}catch(_e){}
+      e.preventDefault();
+    },{capture:true});
+    root.addEventListener('pointermove',e=>{
+      if(!mouseGesture||e.pointerType==='touch')return;
+      const r=root.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,dx=x-mouseGesture.x,dy=y-mouseGesture.y;
+      if(mouseGesture.kind==='pane')pan2D(mouseGesture.startLR,mouseGesture.startPR,dx,dy);
+      else if(mouseGesture.kind==='price')scalePrice(mouseGesture.startPR,dy,mouseGesture.y);
+      else if(mouseGesture.kind==='time')scaleTime(mouseGesture.startLR,dx,mouseGesture.x);
+      e.preventDefault();
+    },{capture:true});
+    root.addEventListener('pointerup',()=>{mouseGesture=null;},{capture:true});
+    root.addEventListener('pointercancel',()=>{mouseGesture=null;},{capture:true});
+    root.addEventListener('wheel',e=>{
+      const r=root.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
+      if(zoneAt(x,y)==='price')scalePrice(priceRange(),e.deltaY*.35,y);
+      else scaleTime(logicalRange(),e.deltaY*.35,x);
+      e.preventDefault();
+    },{passive:false,capture:true});
+
+    // Çift tık/dokunma reset: eksen bölgesine göre.
+    root.addEventListener('dblclick',e=>{
+      const r=root.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,z=zoneAt(x,y);
+      if(z==='price'){pScale.setAutoScale(true);lastManualPriceRange=null;}
+      else if(z==='time'){try{tScale.setVisibleLogicalRange({from:Number(f[0]),to:Number(f[1])});}catch(_e){tScale.fitContent();}}
+      else {pScale.setAutoScale(true);lastManualPriceRange=null;try{tScale.setVisibleLogicalRange({from:Number(f[0]),to:Number(f[1])});}catch(_e){}}
+      e.preventDefault();
+    },{capture:true});
+
+    // Tanılama: deploy sonrası hangi gesture motorunun çalıştığını net görebiliriz.
+    window.__bistLwcDebug={chart,baseSeries,gestureEngine:'v5.3-public-range-controller',version:LWC.version?.()||'5.2.x',logicalRange,priceRange};
   }
 
   loadLibrary().then(init).catch(err=>fail('Grafik motoru yüklenemedi: '+(err?.message||err)));
