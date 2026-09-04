@@ -131,17 +131,17 @@ hr { border-color:#dbe6ee !important; }
     .nav-shell { padding:9px 9px 3px 9px; margin-bottom:10px; }
     .nav-label { font-size:.70rem; margin-bottom:4px; }
     .stButton > button, .stDownloadButton > button { width:100% !important; min-height:2.9rem !important; }
-    [data-testid="stPlotlyChart"] { min-height:540px !important; touch-action:none !important; }
+    [data-testid="stPlotlyChart"] { min-height:640px !important; touch-action:none !important; overscroll-behavior:contain !important; -webkit-user-select:none !important; user-select:none !important; }
     [data-testid="stPlotlyChart"] .js-plotly-plot,
     [data-testid="stPlotlyChart"] .plot-container,
-    [data-testid="stPlotlyChart"] .svg-container { touch-action:none !important; }
+    [data-testid="stPlotlyChart"] .svg-container { touch-action:none !important; overscroll-behavior:contain !important; }
     [data-testid="stPlotlyChart"] .modebar { opacity:1 !important; }
-    [data-testid="stPlotlyChart"] .modebar-btn { min-width:34px !important; min-height:34px !important; padding:7px !important; }
+    [data-testid="stPlotlyChart"] .modebar-btn { min-width:38px !important; min-height:38px !important; padding:8px !important; }
     div[role="radiogroup"] { gap:.25rem !important; flex-wrap:wrap !important; }
 }
 @media (max-width: 430px) {
     .block-container { padding-left:.30rem; padding-right:.30rem; }
-    [data-testid="stPlotlyChart"] { min-height:520px !important; }
+    [data-testid="stPlotlyChart"] { min-height:610px !important; }
 }
 </style>
 """,

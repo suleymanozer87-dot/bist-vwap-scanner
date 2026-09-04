@@ -69,8 +69,8 @@ DOWN_COLOR = "#e2574c"
 # hâlâ belirgin/şişkin görünsün — "hacime göre biraz daha şişir" isteği
 # esas olarak ince uçtaki mumların şişirilmesiyle karşılanıyor, kalın uçta
 # ise küçük bir fedakarlıkla gerçek bir ayrım boşluğu açılıyor.
-MIN_CANDLE_WIDTH = 0.36
-MAX_CANDLE_WIDTH = 0.90
+MIN_CANDLE_WIDTH = 0.22
+MAX_CANDLE_WIDTH = 0.96
 
 # Fitil (wick) genişliği — Low..High çizgisi için SABİT ve İNCE bir genişlik
 # (hacimden bağımsız). Gövde (Open..Close) hacme göre MIN..MAX_CANDLE_WIDTH
@@ -100,11 +100,11 @@ PLOTLY_CONFIG = {
     "responsive": True,
     "scrollZoom": True,
     "displaylogo": False,
-    # Mobilde hover olmadığı için araç çubuğu sürekli görünür. Böylece
-    # Pan / Zoom / +/- / Autoscale / Reset kontrollerine telefonda da
-    # doğrudan dokunulabilir.
     "displayModeBar": True,
+    "showAxisDragHandles": True,
+    "showAxisRangeEntryBoxes": False,
     "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+    "modeBarButtonsToAdd": ["pan2d", "zoom2d", "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d"],
     "doubleClick": "reset+autosize",
 }
 
@@ -143,9 +143,14 @@ def _equivolume_ratio(volume):
 
 
 def _equivolume_widths(ratio):
-    """0..1 hacim oranını MIN_CANDLE_WIDTH..MAX_CANDLE_WIDTH mum
-    genişliğine çevirir."""
-    widths = MIN_CANDLE_WIDTH + ratio * (MAX_CANDLE_WIDTH - MIN_CANDLE_WIDTH)
+    """Hacmi mum gövdesi genişliğine çevirir.
+
+    Yüksek hacimli mumların şişkinliği daha belirgin olsun diye rank oranına
+    hafif konveks eğri uygulanır. Böylece düşük/orta hacim daha ince kalırken
+    yüksek hacim 0.96 genişliğe yaklaşır; komşu mumlarla üst üste binmez.
+    """
+    shaped = ratio.astype(float).clip(lower=0.0, upper=1.0) ** 1.35
+    widths = MIN_CANDLE_WIDTH + shaped * (MAX_CANDLE_WIDTH - MIN_CANDLE_WIDTH)
     return widths.tolist()
 
 
@@ -162,25 +167,15 @@ def _equivolume_colors(ratio, up_mask):
 
 
 def _new_price_volume_figure():
-    """Fiyat (HACİM MUMU) grafiği ÜSTTE, HACİM İNDİKATÖRÜ ALTTA olacak
-    şekilde x ekseni PAYLAŞILAN (shared_xaxes) 2 satırlık bir subplot
-    figürü oluşturur. TradingView'daki gibi: üst panel mumlar + tüm
-    overlay'ler (VWAP/trend çizgisi/üçgen/zigzag vb. — bunlar bu
-    fonksiyonun DIŞINDA, çağıran yerde row=1, col=1 ile eklenir), alt
-    panel ise SADECE hacim çubuklarını gösterir. İki panel aynı x eksenini
-    paylaştığı için birlikte kaydırılır/yakınlaştırılır.
+    """Tek fiyat paneli oluşturur.
+
+    Ayrı hacim paneli V4.8 itibarıyla hem mobil hem PC'de kaldırıldı. Hacim
+    bilgisi üstteki equivolume mumların GENİŞLİĞİ ve renk doygunluğu ile
+    taşınmaya devam eder.
     """
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.72, 0.28], vertical_spacing=0.035,
-    )
-    # barmode="overlay": üst paneldeki fitil + gövde bar'ları (bkz.
-    # _add_equivolume_candles) yan yana değil, AYNI x konumunda ÜST ÜSTE
-    # çizilsin diye — aksi halde Plotly'nin varsayılan "group" modu ikisini
-    # yan yana ayrı mumlar gibi ikiye böler.
+    fig = make_subplots(rows=1, cols=1)
     fig.update_layout(barmode="overlay")
     return fig
-
 
 def _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym):
     """Üst panele (row=1) FİTİLLİ hacim mumlarını ekler — iki bar trace'i
@@ -226,71 +221,41 @@ def _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym):
 
 
 def _add_volume_bars(fig, x, volume, widths, colors):
-    """Alt panele (row=2) HACİM İNDİKATÖRÜNÜ ekler — her çubuk, üstteki
-    equivolume mumuyla AYNI genişlikte ve AYNI (hacme göre açık/koyu
-    tonlanmış) renkte çizilir ki üst-alt hizası bozulmasın ve renk dili
-    tutarlı kalsın."""
-    vol_hover = [f"Hacim: {v:,.0f}" for v in volume.tolist()]
-    fig.add_trace(go.Bar(
-        x=x, y=volume.tolist(), width=widths,
-        marker_color=colors, marker_line_width=0,
-        name="Hacim", showlegend=False,
-        hovertext=vol_hover, hoverinfo="text",
-    ), row=2, col=1)
+    """V4.8: ayrı hacim paneli kaldırıldı.
 
+    Fonksiyon geriye dönük çağrılar bozulmasın diye no-op olarak tutulur.
+    Hacim bilgisi equivolume mum genişliği/renk tonu ile gösterilir.
+    """
+    return None
 
 def _finalize_price_volume_axes(fig, tickvals, ticktext, price_range, y_title):
-    """Üst panel (fiyat) ve alt panel (hacim) eksenlerini TradingView
-    mantığında (fiyat sağda, crosshair, döndürülmüş tarih etiketleri SADECE
-    alt panelde) ortak şekilde ayarlar. price_range verilirse üst panelin
-    y ekseni buna sabitlenir (verilmezse otomatik ölçeklenir)."""
-    # Üst panel x ekseni: tarih etiketleri GÖSTERİLMEZ (alt panelde zaten
-    # var, iki panel aynı x eksenini paylaşıyor) — sadece crosshair kalır.
-    # DÜZELTME: spikemode'a "toaxis" eklendi. Sadece "across" ile crosshair
-    # çizgisi çiziliyor ama eksende DEĞERİ gösteren bir kutu belirmiyordu
-    # ("imlecin olduğu yerin fiyatı görünmüyor" şikayeti). "toaxis" eklenince
-    # Plotly, imlecin hizasındaki fiyatı/tarihi sağ/alt eksende küçük bir
-    # etiket kutusu içinde gösteriyor (TradingView'daki imleç etiketi gibi).
+    """Tek fiyat panelinin eksenlerini mobil + PC etkileşimine göre ayarlar.
+
+    - x/y fixedrange=False: pan/zoom serbest
+    - fiyat ekseni sağda ve geniş hit alanıyla kullanılabilir
+    - Plotly showAxisDragHandles ile sağ eksenden dikey ölçekleme aktif
+    - ayrı hacim paneli/range slider yok; grafik alanı tamamen fiyata ayrılır
+    """
     fig.update_xaxes(
         row=1, col=1,
-        rangeslider_visible=False, showgrid=False,
-        showticklabels=False, fixedrange=False,
-        showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
-        spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
-    )
-    # Alt panel x ekseni: asıl tarih etiketleri BURADA.
-    fig.update_xaxes(
-        row=2, col=1,
         tickvals=tickvals, ticktext=ticktext, tickangle=-35,
-        # Mobilde grafiğin kendisini sürüklemek zor olursa alttaki zaman
-        # sürgüsüyle görünür pencere kolayca sağa/sola taşınabilir.
-        rangeslider=dict(visible=True, thickness=0.07, bgcolor="#eef2f7", bordercolor="#cbd5e1", borderwidth=1),
-        showgrid=False,
-        showticklabels=True, tickfont=dict(size=10), fixedrange=False,
+        rangeslider_visible=False, showgrid=False, showticklabels=True,
+        tickfont=dict(size=10), fixedrange=False,
         showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
         spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
+        automargin=True,
     )
     yaxis_kwargs = dict(
-        title_text=y_title,
-        side="right",  # TradingView gibi fiyat ekseni sağda
-        showticklabels=True, tickfont=dict(size=10), fixedrange=False,
+        title_text=y_title, side="right",
+        showticklabels=True, tickfont=dict(size=11), fixedrange=False,
         showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
         spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
+        automargin=True,
     )
     if price_range is not None:
         yaxis_kwargs["range"] = price_range
+        yaxis_kwargs["autorange"] = False
     fig.update_yaxes(row=1, col=1, **yaxis_kwargs)
-    # Alt panel y ekseni: hacim — büyük sayılar SI-önekli (12M, 350K vb.)
-    # kısaltılıyor ki eksen kalabalıklaşmasın.
-    fig.update_yaxes(
-        row=2, col=1,
-        title_text="Hacim", side="right",
-        showgrid=False, tickfont=dict(size=10), tickformat=".2s",
-        nticks=3, fixedrange=False,
-        showspikes=True, spikemode="across+toaxis", spikesnap="cursor",
-        spikethickness=1, spikedash="solid", spikecolor="#9aa5b1",
-    )
-
 
 def _focus_recent_pattern(fig, n, start_hint=None, end_extra=2, min_bars=55, max_bars=105):
     """Mobil/dar ekranlarda tüm geçmişi ezmek yerine sinyale yakın bölgeyi gösterir.
@@ -311,7 +276,6 @@ def _focus_recent_pattern(fig, n, start_hint=None, end_extra=2, min_bars=55, max
             start = max(0, last - max_bars + 1)
     end = last + max(1, int(end_extra or 0))
     fig.update_xaxes(range=[start - 0.5, end + 0.5], row=1, col=1)
-    fig.update_xaxes(range=[start - 0.5, end + 0.5], row=2, col=1)
     return start, min(last, end)
 
 
@@ -334,7 +298,7 @@ def _mobile_friendly_layout(fig, title):
     """Masaüstünde de temiz, telefonda dokunarak kullanılabilen ortak görünüm."""
     fig.update_layout(
         title=dict(text=title, font=dict(size=16), x=0.01, xanchor="left"),
-        height=560,
+        height=640,
         template="plotly_white",
         # Varsayılan hareket tek parmakla kaydırma. Kullanıcı araç çubuğundan
         # büyüteci seçerse kutu/zoom moduna geçebilir.
@@ -343,7 +307,7 @@ def _mobile_friendly_layout(fig, title):
             orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
             font=dict(size=9), itemwidth=30,
         ),
-        margin=dict(l=6, r=42, t=78, b=52),
+        margin=dict(l=6, r=72, t=72, b=58),
         bargap=0.0,
         hovermode="closest",
         hoverlabel=dict(font_size=11),
@@ -369,7 +333,7 @@ def _chart_view_controls(fig, df, default_start, default_end, key):
         key=f"{safe_key}_view",
         label_visibility="collapsed",
     )
-    st.caption("📱 Tek parmak: kaydır · İki parmak: yakınlaştır · Üst araç çubuğu: Pan / Zoom / +/- / Sıfırla")
+    st.caption("📱 Tek parmak: kaydır · İki parmak: pinch yakınlaştır/uzaklaştır · Sağ fiyat eksenini sürükle: dikey ölçekle")
 
     if choice == "40 mum":
         start, end = max(0, n - 40), n - 1
@@ -383,7 +347,6 @@ def _chart_view_controls(fig, df, default_start, default_end, key):
 
     # Sağ tarafta iki mum kadar boşluk, son fiyat etiketinin sıkışmasını önler.
     fig.update_xaxes(range=[start - 0.5, end + 2.5], row=1, col=1)
-    fig.update_xaxes(range=[start - 0.5, end + 2.5], row=2, col=1)
     return start, end
 
 
@@ -442,7 +405,6 @@ def render_vwap_chart(sym, r, key=None):
 
     # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
-    _add_volume_bars(fig, x, volume, widths, colors)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
     # --- Zincirlenmiş VWAP seviyeleri ---
@@ -556,7 +518,6 @@ def render_triangle_chart(sym, r, key=None):
 
     # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
-    _add_volume_bars(fig, x, volume, widths, colors)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
     # --- Üst çizgi (direnç) + alt çizgi (destek) — pivot aralığında düz,
@@ -668,7 +629,6 @@ def render_trendline_chart(sym, r, key=None):
 
     # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
-    _add_volume_bars(fig, x, volume, widths, colors)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
     # --- Düşen Trend Çizgisi + uzantısı + kırılım noktası ---
@@ -753,7 +713,6 @@ def render_alternation_chart(sym, r, key=None):
 
     # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
-    _add_volume_bars(fig, x, volume, widths, colors)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
     # --- Zigzag zincirini vurgulayan gölgeli bölge + gövde-tepe çizgisi ---
