@@ -17,17 +17,17 @@ TradingView mantığı:
   - Fare tekerleği  -> yakınlaştır / uzaklaştır (scrollZoom)
   - Sürükleme       -> grafiği kaydır (pan)
 
-HACİM İNDİKATÖRÜ (alt panel):
-  - Her grafiğin ALT KISMINDA, fiyat panelinin x eksenini PAYLAŞAN ayrı
-    bir hacim çubuğu paneli bulunur (bkz. _new_price_volume_figure /
-    _add_volume_bars). Çubuklar üstteki equivolume mumlarıyla AYNI
-    genişlik/renkte çizilir, böylece hangi hacim çubuğunun hangi muma
-    ait olduğu tek bakışta anlaşılır.
+HACİM GÖSTERİMİ:
+  - Ayrı hacim paneli YOKTUR. Hacim yalnız normal fiyat mumunun GÖVDE
+    genişliğine yansır: yüksek hacim = daha şişkin mum, düşük hacim = ince mum.
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
+import hashlib
 
 VWAP_COLORS = {1: "#3ddc84", 2: "#5eb0ef", 3: "#e8b545"}
 
@@ -69,8 +69,8 @@ DOWN_COLOR = "#e2574c"
 # hâlâ belirgin/şişkin görünsün — "hacime göre biraz daha şişir" isteği
 # esas olarak ince uçtaki mumların şişirilmesiyle karşılanıyor, kalın uçta
 # ise küçük bir fedakarlıkla gerçek bir ayrım boşluğu açılıyor.
-MIN_CANDLE_WIDTH = 0.22
-MAX_CANDLE_WIDTH = 0.96
+MIN_CANDLE_WIDTH = 0.18
+MAX_CANDLE_WIDTH = 0.98
 
 # Fitil (wick) genişliği — Low..High çizgisi için SABİT ve İNCE bir genişlik
 # (hacimden bağımsız). Gövde (Open..Close) hacme göre MIN..MAX_CANDLE_WIDTH
@@ -149,7 +149,7 @@ def _equivolume_widths(ratio):
     hafif konveks eğri uygulanır. Böylece düşük/orta hacim daha ince kalırken
     yüksek hacim 0.96 genişliğe yaklaşır; komşu mumlarla üst üste binmez.
     """
-    shaped = ratio.astype(float).clip(lower=0.0, upper=1.0) ** 1.35
+    shaped = ratio.astype(float).clip(lower=0.0, upper=1.0) ** 1.90
     widths = MIN_CANDLE_WIDTH + shaped * (MAX_CANDLE_WIDTH - MIN_CANDLE_WIDTH)
     return widths.tolist()
 
@@ -214,8 +214,8 @@ def _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym):
     ]
     fig.add_trace(go.Bar(
         x=x, y=body_heights, base=body_bases, width=widths,
-        marker_color=colors, marker_line_color="#0c0f14", marker_line_width=0.9,
-        name=sym, opacity=0.95,
+        marker_color=colors, marker_line_color="#0c0f14", marker_line_width=0.7,
+        name=sym, opacity=0.98,
         hovertext=hover_text, hoverinfo="text",
     ), row=1, col=1)
 
@@ -333,7 +333,7 @@ def _chart_view_controls(fig, df, default_start, default_end, key):
         key=f"{safe_key}_view",
         label_visibility="collapsed",
     )
-    st.caption("📱 Tek parmak: kaydır · İki parmak: pinch yakınlaştır/uzaklaştır · Sağ fiyat eksenini sürükle: dikey ölçekle")
+    st.caption("📱 Tek parmak: kaydır · İki parmak: pinch zoom · Sağ fiyat sütununu yukarı/aşağı sürükle: mumları dikey büyüt/küçült · Mum genişliği hacme göre değişir")
 
     if choice == "40 mum":
         start, end = max(0, n - 40), n - 1
@@ -349,6 +349,209 @@ def _chart_view_controls(fig, df, default_start, default_end, key):
     fig.update_xaxes(range=[start - 0.5, end + 2.5], row=1, col=1)
     return start, end
 
+
+def _render_interactive_chart(fig, key=None, height=700):
+    """Mobil + PC icin TradingView benzeri dokunmatik grafik katmani."""
+    raw_key = str(key or "chart")
+    div_id = "bistchart_" + hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:12]
+    config = dict(PLOTLY_CONFIG)
+    config["responsive"] = True
+    config["displayModeBar"] = True
+
+    post_script = r'''
+(function(){
+  const gd = document.getElementById("{plot_id}");
+  if (!gd || gd.__bistTouchReady) return;
+  gd.__bistTouchReady = true;
+
+  let pinch = null;
+  let yTouch = null;
+  let yMouse = null;
+  let manualY = false;
+  let relayoutLock = false;
+
+  const clamp = (v,a,b) => Math.max(a, Math.min(b,v));
+  const numRange = (axis) => {
+    const r = axis && axis.range;
+    if (!r || r.length < 2) return null;
+    const a = Number(r[0]), b = Number(r[1]);
+    return Number.isFinite(a) && Number.isFinite(b) ? [a,b] : null;
+  };
+  const plotSize = () => (gd._fullLayout && gd._fullLayout._size) ? gd._fullLayout._size : null;
+
+  function visiblePriceRange(xr){
+    const wick = gd.data && gd.data[0];
+    if (!wick || !wick.x || !wick.base || !wick.y) return null;
+    let lo = Infinity, hi = -Infinity, found = 0;
+    const x0 = Math.min(xr[0], xr[1]), x1 = Math.max(xr[0], xr[1]);
+    for (let i=0; i<wick.x.length; i++){
+      const xv = Number(wick.x[i]);
+      if (!Number.isFinite(xv) || xv < x0 || xv > x1) continue;
+      const l = Number(wick.base[i]);
+      const span = Number(wick.y[i]);
+      if (!Number.isFinite(l) || !Number.isFinite(span)) continue;
+      lo = Math.min(lo, l);
+      hi = Math.max(hi, l + span);
+      found++;
+    }
+    if (!found || !Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+    const pad = Math.max((hi-lo)*0.10, Math.abs(hi)*0.006, 0.01);
+    return [lo-pad, hi+pad];
+  }
+
+  function autoYForX(xr){
+    if (manualY || relayoutLock) return;
+    const yr = visiblePriceRange(xr);
+    if (!yr) return;
+    relayoutLock = true;
+    Plotly.relayout(gd, {"yaxis.range": yr, "yaxis.autorange": false})
+      .finally(() => { relayoutLock = false; });
+  }
+
+  function currentXRange(){ return numRange(gd._fullLayout && gd._fullLayout.xaxis); }
+  function currentYRange(){ return numRange(gd._fullLayout && gd._fullLayout.yaxis); }
+  function touchPoint(t, rect){ return {x:t.clientX-rect.left, y:t.clientY-rect.top}; }
+
+  gd.addEventListener("touchstart", function(e){
+    const sz = plotSize();
+    if (!sz) return;
+    const rect = gd.getBoundingClientRect();
+
+    if (e.touches.length === 2){
+      const p1 = touchPoint(e.touches[0], rect), p2 = touchPoint(e.touches[1], rect);
+      const xr = currentXRange();
+      if (!xr) return;
+      const d = Math.hypot(p2.x-p1.x, p2.y-p1.y);
+      if (d < 5) return;
+      const cx = (p1.x+p2.x)/2;
+      pinch = {dist:d, xr:xr, cx:cx, size:sz};
+      yTouch = null;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return;
+    }
+
+    if (e.touches.length === 1){
+      const p = touchPoint(e.touches[0], rect);
+      const plotRight = sz.l + sz.w;
+      if (p.x >= plotRight - 12){
+        const yr = currentYRange();
+        if (yr){
+          yTouch = {startY:p.y, yr:yr, center:(yr[0]+yr[1])/2};
+          pinch = null;
+          manualY = true;
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      }
+    }
+  }, {passive:false, capture:true});
+
+  gd.addEventListener("touchmove", function(e){
+    const rect = gd.getBoundingClientRect();
+    if (pinch && e.touches.length === 2){
+      const p1 = touchPoint(e.touches[0], rect), p2 = touchPoint(e.touches[1], rect);
+      const d = Math.hypot(p2.x-p1.x, p2.y-p1.y);
+      if (d < 5) return;
+      const factor = clamp(pinch.dist / d, 0.18, 5.5);
+      const oldSpan = pinch.xr[1]-pinch.xr[0];
+      const newSpan = Math.max(6, oldSpan * factor);
+      const frac = clamp((pinch.cx - pinch.size.l) / pinch.size.w, 0, 1);
+      const centerData = pinch.xr[0] + oldSpan * frac;
+      const nr = [centerData - newSpan*frac, centerData + newSpan*(1-frac)];
+      relayoutLock = true;
+      Plotly.relayout(gd, {"xaxis.range": nr})
+        .then(() => { relayoutLock = false; autoYForX(nr); })
+        .catch(() => { relayoutLock = false; });
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return;
+    }
+
+    if (yTouch && e.touches.length === 1){
+      const p = touchPoint(e.touches[0], rect);
+      const dy = p.y - yTouch.startY;
+      const factor = clamp(Math.exp(dy/210), 0.22, 4.5);
+      const span = (yTouch.yr[1]-yTouch.yr[0]) * factor;
+      const nr = [yTouch.center-span/2, yTouch.center+span/2];
+      relayoutLock = true;
+      Plotly.relayout(gd, {"yaxis.range": nr, "yaxis.autorange": false})
+        .finally(() => { relayoutLock = false; });
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+  }, {passive:false, capture:true});
+
+  gd.addEventListener("touchend", function(e){
+    if (e.touches.length < 2) pinch = null;
+    if (e.touches.length === 0) yTouch = null;
+  }, {passive:false, capture:true});
+  gd.addEventListener("touchcancel", function(){ pinch=null; yTouch=null; }, {passive:false, capture:true});
+
+  gd.addEventListener("mousedown", function(e){
+    if (e.button !== 0) return;
+    const sz = plotSize(); if (!sz) return;
+    const rect = gd.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const plotRight = sz.l + sz.w;
+    if (x < plotRight - 8) return;
+    const yr = currentYRange(); if (!yr) return;
+    yMouse = {startY:e.clientY, yr:yr, center:(yr[0]+yr[1])/2};
+    manualY = true;
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+
+  window.addEventListener("mousemove", function(e){
+    if (!yMouse) return;
+    const dy = e.clientY - yMouse.startY;
+    const factor = clamp(Math.exp(dy/240), 0.20, 5.0);
+    const span = (yMouse.yr[1]-yMouse.yr[0]) * factor;
+    const nr = [yMouse.center-span/2, yMouse.center+span/2];
+    relayoutLock = true;
+    Plotly.relayout(gd, {"yaxis.range": nr, "yaxis.autorange": false})
+      .finally(() => { relayoutLock = false; });
+  }, true);
+  window.addEventListener("mouseup", function(){ yMouse=null; }, true);
+
+  gd.on("plotly_relayout", function(ev){
+    if (relayoutLock) return;
+    if (ev["yaxis.autorange"] === true) manualY = false;
+    const x0 = ev["xaxis.range[0]"];
+    const x1 = ev["xaxis.range[1]"];
+    if (x0 !== undefined && x1 !== undefined){
+      const xr = [Number(x0), Number(x1)];
+      if (Number.isFinite(xr[0]) && Number.isFinite(xr[1])) autoYForX(xr);
+    } else if (Array.isArray(ev["xaxis.range"])) {
+      const xr = ev["xaxis.range"].map(Number);
+      if (Number.isFinite(xr[0]) && Number.isFinite(xr[1])) autoYForX(xr);
+    }
+  });
+})();
+'''
+
+    html_chart = pio.to_html(
+        fig,
+        config=config,
+        include_plotlyjs="cdn",
+        full_html=False,
+        default_width="100%",
+        default_height=f"{height}px",
+        div_id=div_id,
+        post_script=post_script,
+    )
+    css = f"""
+    <style>
+      html,body{{margin:0;padding:0;overflow:hidden;background:#fff;}}
+      #{div_id}{{width:100% !important;height:{height}px !important;touch-action:none !important;overscroll-behavior:contain;user-select:none;-webkit-user-select:none;}}
+      #{div_id} .modebar{{opacity:1 !important;}}
+      #{div_id} .modebar-btn{{min-width:34px !important;min-height:34px !important;padding:7px !important;}}
+      @media (max-width:760px){{
+        #{div_id} .modebar-btn{{min-width:40px !important;min-height:40px !important;padding:9px !important;}}
+      }}
+    </style>
+    """
+    components.html(css + html_chart, height=height + 8, scrolling=False)
 
 def _add_last_price_line(fig, last_price, is_up):
     """Üst panelin sağ kenarına, TradingView'daki gibi SON FİYATI gösteren
@@ -403,7 +606,7 @@ def render_vwap_chart(sym, r, key=None):
 
     fig = _new_price_volume_figure()
 
-    # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
+    # --- Normal fiyat mumları: gövde genişliği hacme göre değişir (ayrı hacim paneli yok) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
@@ -481,7 +684,7 @@ def render_vwap_chart(sym, r, key=None):
         y_title=f"Fiyat ({currency_label})",
     )
 
-    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key=key)
+    _render_interactive_chart(fig, key=key, height=700)
 
 
 def render_triangle_chart(sym, r, key=None):
@@ -516,7 +719,7 @@ def render_triangle_chart(sym, r, key=None):
 
     fig = _new_price_volume_figure()
 
-    # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
+    # --- Normal fiyat mumları: gövde genişliği hacme göre değişir (ayrı hacim paneli yok) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
@@ -593,7 +796,7 @@ def render_triangle_chart(sym, r, key=None):
         y_title="Fiyat (TL)",
     )
 
-    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key=key)
+    _render_interactive_chart(fig, key=key, height=700)
 
 
 def render_trendline_chart(sym, r, key=None):
@@ -627,7 +830,7 @@ def render_trendline_chart(sym, r, key=None):
 
     fig = _new_price_volume_figure()
 
-    # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
+    # --- Normal fiyat mumları: gövde genişliği hacme göre değişir (ayrı hacim paneli yok) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
@@ -678,7 +881,7 @@ def render_trendline_chart(sym, r, key=None):
         y_title="Fiyat (TL)",
     )
 
-    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key=key)
+    _render_interactive_chart(fig, key=key, height=700)
 
 
 def render_alternation_chart(sym, r, key=None):
@@ -711,7 +914,7 @@ def render_alternation_chart(sym, r, key=None):
 
     fig = _new_price_volume_figure()
 
-    # --- Hacim Mumu (Equivolume, üst panel) + Hacim İndikatörü (alt panel) ---
+    # --- Normal fiyat mumları: gövde genişliği hacme göre değişir (ayrı hacim paneli yok) ---
     _add_equivolume_candles(fig, x, df, widths, colors, hover_text, sym)
     _add_last_price_line(fig, float(df["Close"].iloc[-1]), bool(up_mask.iloc[-1]))
 
@@ -758,4 +961,4 @@ def render_alternation_chart(sym, r, key=None):
         y_title="Fiyat (TL)",
     )
 
-    st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key=key)
+    _render_interactive_chart(fig, key=key, height=700)
