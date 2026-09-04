@@ -8,6 +8,7 @@ Worker kesilirse sonraki açılışta aynı job_id ile kaldığı bloktan devam 
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import time
@@ -95,14 +96,44 @@ def _merge_rows(old_rows, new_rows):
     return out
 
 
+def _normalize_error_item(item):
+    """Worker sonucunda hata kayıtlarını JSON-uyumlu [symbol, message] biçiminde tut."""
+    if isinstance(item, str):
+        text = item.strip()
+        if text.startswith(("(", "[", "{")):
+            try:
+                parsed = ast.literal_eval(text)
+            except Exception:
+                parsed = None
+            if parsed is not None and parsed is not item:
+                return _normalize_error_item(parsed)
+        if ": " in text:
+            sym, msg = text.split(": ", 1)
+            return [sym.strip() or "—", msg.strip() or "Bilinmeyen hata"]
+        return ["—", text or "Bilinmeyen hata"]
+    if isinstance(item, dict):
+        sym = item.get("symbol") or item.get("sym") or item.get("ticker") or item.get("code") or "—"
+        msg = item.get("error") or item.get("message") or item.get("detail") or item.get("reason") or str(item)
+        return [str(sym), str(msg)]
+    if isinstance(item, (list, tuple)):
+        if len(item) >= 2:
+            return [str(item[0] or "—"), " | ".join(str(x) for x in item[1:] if x not in (None, "")) or "Bilinmeyen hata"]
+        if len(item) == 1:
+            return ["—", str(item[0])]
+        return ["—", "Bilinmeyen hata"]
+    # Eski checkpoint'lerde str(tuple) bulunabilir; biçimi burada bozmadan UI güvenli okuyacak.
+    return ["—", str(item) if item is not None else "Bilinmeyen hata"]
+
+
 def _dedupe_errors(items):
     out = []
     seen = set()
     for x in items or []:
-        s = str(x)
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
+        row = _normalize_error_item(x)
+        key = (row[0], row[1])
+        if key not in seen:
+            seen.add(key)
+            out.append(row)
     return out
 
 

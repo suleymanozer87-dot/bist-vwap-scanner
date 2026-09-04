@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """BIST VWAP Tarayıcı — sade, mobil uyumlu Streamlit arayüzü."""
 
+import ast
 import json
 import os
 import sys
@@ -250,6 +251,42 @@ def q_grade(r):
 
 def q_reasons(r, limit=3):
     return " · ".join((((r or {}).get("quality") or {}).get("reasons") or [])[:limit]) or "—"
+
+
+def normalize_error_entry(item):
+    """Eski/yeni worker hata biçimlerini güvenle (sembol, mesaj) çiftine çevirir."""
+    # Eski V4.6 worker bazı tuple kayıtlarını str(tuple) olarak diske yazdı.
+    if isinstance(item, str):
+        text = item.strip()
+        if text.startswith(("(", "[", "{")):
+            try:
+                parsed = ast.literal_eval(text)
+            except Exception:
+                parsed = None
+            if parsed is not None and parsed is not item:
+                return normalize_error_entry(parsed)
+        if ": " in text:
+            sym, msg = text.split(": ", 1)
+            return (sym.strip() or "—", msg.strip() or "Bilinmeyen hata")
+        return ("—", text or "Bilinmeyen hata")
+
+    if isinstance(item, dict):
+        sym = item.get("symbol") or item.get("sym") or item.get("ticker") or item.get("code") or "—"
+        msg = item.get("error") or item.get("message") or item.get("detail") or item.get("reason")
+        if msg is None:
+            msg = json.dumps(item, ensure_ascii=False, default=str)
+        return (str(sym), str(msg))
+
+    if isinstance(item, (list, tuple)):
+        if len(item) >= 2:
+            sym = item[0] if item[0] not in (None, "") else "—"
+            msg = " | ".join(str(x) for x in item[1:] if x not in (None, "")) or "Bilinmeyen hata"
+            return (str(sym), msg)
+        if len(item) == 1:
+            return ("—", str(item[0]))
+        return ("—", "Bilinmeyen hata")
+
+    return ("—", str(item) if item is not None else "Bilinmeyen hata")
 
 
 def ensure_result_store():
@@ -774,7 +811,8 @@ def render_results_page():
     )
     if errors:
         with st.expander(f"Veri hataları ({len(errors)})"):
-            for sym, err in errors[:50]:
+            for item in errors[:50]:
+                sym, err = normalize_error_entry(item)
                 st.code(f"{sym}: {err}")
 
 
